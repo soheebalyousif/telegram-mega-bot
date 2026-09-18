@@ -206,7 +206,7 @@ function parsePinLine(caption, knownDoctors = []) {
     }
   }
 
-  const cleanTitle = titlePart.replace(/[\\/:*?"<>|]/g, '').trim();
+ const cleanTitle = titlePart.replace(/[\\/:*?"<>|]/g, '').replace(/\.+$/, '').trim();
   const cleanDoctor = doctorPart
     .replace(/^(د\.?|الدكتور|الدكتورة)\s*/i, '')
     .replace(/[\\/:*?"<>|.]/g, '')
