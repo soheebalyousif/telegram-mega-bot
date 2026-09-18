@@ -10,7 +10,7 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || 'root';
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Sheet1!A2:C';
+const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || '';
 
 if (
   !BOT_TOKEN ||
@@ -54,6 +54,7 @@ const MAX_HANDLED_MESSAGES = 5000;
 let allowedUsersCache = new Map();
 let allowedUsersCacheAt = 0;
 const SHEET_CACHE_TTL_MS = 60 * 1000;
+let resolvedSheetRange = null;
 
 function enqueueUpload(task) {
   const result = uploadQueue.then(task, task);
@@ -67,9 +68,28 @@ async function getAllowedUsers() {
     return allowedUsersCache;
   }
 
+  if (!resolvedSheetRange) {
+    if (GOOGLE_SHEET_RANGE) {
+      resolvedSheetRange = GOOGLE_SHEET_RANGE;
+    } else {
+      const spreadsheet = await sheets.spreadsheets.get({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        fields: 'sheets.properties.title'
+      });
+      const firstSheetTitle = spreadsheet.data.sheets?.[0]?.properties?.title;
+
+      if (!firstSheetTitle) {
+        throw new Error('لم يتم العثور على أي تبويب داخل Google Sheet.');
+      }
+
+      const escapedTitle = firstSheetTitle.replace(/'/g, "''");
+      resolvedSheetRange = `'${escapedTitle}'!A2:C`;
+    }
+  }
+
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
-    range: GOOGLE_SHEET_RANGE,
+    range: resolvedSheetRange,
     majorDimension: 'ROWS'
   });
 
@@ -267,6 +287,11 @@ bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
   const senderId = String(ctx.from?.id || '');
   if (!(await isUserAllowed(senderId))) {
     console.log(`تم رفض ملف من مستخدم غير مصرح له: ${senderId || 'unknown'}`);
+    try {
+      await ctx.reply('⛔ عذرًا، أنت غير مصرح لك باستخدام هذا البوت لرفع الملفات.');
+    } catch (replyError) {
+      console.error('تعذر إرسال رسالة الرفض:', replyError?.message || replyError);
+    }
     return;
   }
 
@@ -451,7 +476,7 @@ telegram_id | name | active
 123456789 | أحمد | yes
 987654321 | سارة | no
 
-GOOGLE_SHEET_RANGE الافتراضي هو Sheet1!A2:C.
+GOOGLE_SHEET_RANGE اختياري. إذا تركته فارغًا، يقرأ الكود الأعمدة A2:C من أول تبويب تلقائيًا.
 القيمة yes أو true أو 1 أو نعم أو فعال أو مفعل تعني أن المستخدم مسموح.
 
 GOOGLE_DRIVE_FOLDER_ID هو معرّف المجلد الرئيسي في Google Drive.
