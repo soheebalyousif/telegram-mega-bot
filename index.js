@@ -1,4 +1,4 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const http = require('http');
 const { google } = require('googleapis');
@@ -22,7 +22,7 @@ if (
   !GOOGLE_REFRESH_TOKEN ||
   !GOOGLE_SHEET_ID
 ) {
-  console.error('الرجاء تعبئة جميع المتغيرات المطلوبة (BOT_TOKEN, Google OAuth, GOOGLE_SHEET_ID).');
+  console.error('الرجاء تعبئة جميع المتغيرات المطلوبة.');
   process.exit(1);
 }
 
@@ -46,12 +46,15 @@ const folderCache = new Map();
 const handledMessages = new Set();
 const MAX_HANDLED_MESSAGES = 5000;
 
+// تخزين حالات المستخدمين (إعادة التسمية، النقل، الأزرار التفاعلية)
+const userSessions = new Map();
+
 // Caches
 let allowedUsersCache = new Map();
 let allowedUsersCacheAt = 0;
 let subjectsCache = [];
 let subjectsCacheAt = 0;
-const CACHE_TTL_MS = 60 * 1000; // تحديث الكاش كل دقيقة
+const CACHE_TTL_MS = 60 * 1000;
 
 let resolvedUsersSheetTitle = null;
 let resolvedSubjectsSheetTitle = null;
@@ -62,7 +65,16 @@ function enqueueUpload(task) {
   return result;
 }
 
-// تطبيع النصوص العربية لمطابقة ذكية
+// تنظيف الجلسات المؤقتة كل 10 دقائق
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, session] of userSessions.entries()) {
+    if (session.expiresAt && now > session.expiresAt) {
+      userSessions.delete(key);
+    }
+  }
+}, 10 * 60 * 1000);
+
 function normalizeArabic(str) {
   return String(str || '')
     .trim()
@@ -89,7 +101,6 @@ function sanitizeFolderName(name) {
   return cleaned || 'Others';
 }
 
-// تحويل الأرقام العربية النصية (مثل: الحادية والعشرون) إلى أرقام رقمية (21)
 function parseArabicLectureNumber(text) {
   if (!text) return '';
   const digitsOnly = text.match(/\d+/);
@@ -118,14 +129,12 @@ function parseArabicLectureNumber(text) {
     'خمسون': 50, 'خمسين': 50
   };
 
-  // فحص المركبات مثل (الحادية عشرة، الثانية عشرة)
   for (const [uWord, uVal] of Object.entries(units)) {
     if (uVal < 10 && (norm.includes(`${uWord} عشر`) || norm.includes(`${uWord} عشره`))) {
       return String(10 + uVal);
     }
   }
 
-  // فحص العقود مع الواو مثل (الحادية والعشرون)
   let foundUnit = 0;
   let foundTen = 0;
 
@@ -143,19 +152,14 @@ function parseArabicLectureNumber(text) {
     }
   }
 
-  if (foundTen > 0) {
-    return String(foundTen + foundUnit);
-  }
-
-  if (foundUnit > 0) {
-    return String(foundUnit);
-  }
+  if (foundTen > 0) return String(foundTen + foundUnit);
+  if (foundUnit > 0) return String(foundUnit);
 
   return '';
 }
 
-// تحليل سطر الدبوس 📌
-function parsePinLine(caption) {
+// كشف ذكي لسطر الدبوس سواء كان الدكتور بالوسط أو بالآخر
+function parsePinLine(caption, knownDoctors = []) {
   if (!caption) return null;
   const lines = caption.split('\n');
   const pinLine = lines.find((l) => l.includes('📌') || (l.includes('المحاضرة') && l.includes('-')));
@@ -166,10 +170,42 @@ function parsePinLine(caption) {
   if (parts.length < 2) return null;
 
   const lecturePart = parts[0] || '';
-  const titlePart = parts[1] || '';
-  const doctorPart = parts.length >= 3 ? parts[2] : '';
+  const p1 = parts[1] || '';
+  const p2 = parts.length >= 3 ? parts[2] : '';
 
   const lecNum = parseArabicLectureNumber(lecturePart);
+
+  // دالة لمعرفة هل الجزء يمثل دكتوراً
+  function isDoctor(str) {
+    if (!str) return false;
+    const norm = normalizeArabic(str);
+    if (norm.startsWith('د ') || norm.startsWith('د.') || norm.startsWith('الدكتور') || norm.startsWith('الدكتوره')) {
+      return true;
+    }
+    return knownDoctors.some((doc) => norm.includes(normalizeArabic(doc)));
+  }
+
+  let titlePart = '';
+  let doctorPart = '';
+
+  if (parts.length === 2) {
+    if (isDoctor(p1)) doctorPart = p1;
+    else titlePart = p1;
+  } else {
+    // 3 أجزاء
+    if (isDoctor(p1)) {
+      doctorPart = p1;
+      titlePart = p2;
+    } else if (isDoctor(p2)) {
+      doctorPart = p2;
+      titlePart = p1;
+    } else {
+      // افتراضي: الوسط عنوان والآخر دكتور
+      titlePart = p1;
+      doctorPart = p2;
+    }
+  }
+
   const cleanTitle = titlePart.replace(/[\\/:*?"<>|]/g, '').trim();
   const cleanDoctor = doctorPart
     .replace(/^(د\.?|الدكتور|الدكتورة)\s*/i, '')
@@ -364,7 +400,6 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
     }
   }
 
-  // إذا لم يجد في الهاشتاقات، يبحث في نص الرسالة بالكامل
   if (matchedRows.length === 0) {
     for (const sub of subjects) {
       if (fullTextNorm.includes(sub.normHashtag)) {
@@ -404,10 +439,9 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
   const selectedSubject = matchedRows[0];
   const folderName = selectedSubject.folderName;
 
-  // 3. فحص سطر الدبوس 📌 (لاستخراج الدكتور وتسمية الملف إن وُجد)
-  const pinInfo = parsePinLine(caption);
+  // 3. تحليل سطر الدبوس 📌
+  const pinInfo = parsePinLine(caption, selectedSubject.theory);
 
-  // حساب اسم الملف
   let finalFileName = originalFileName;
   const ext = path.extname(originalFileName) || '.pdf';
 
@@ -419,7 +453,7 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
     }
   }
 
-  // 4. تحديد النوع الرئيسي (ستاج، عملي، دورات، إكسترا، نظري)
+  // 4. فحص نوع الملف
   const isStage = normTags.some((t) => t.includes('ستاج') || t.includes('اوسكي'));
   const isPractical = normTags.some((t) => t.includes('عملي'));
   const isCourses = normTags.some(
@@ -431,13 +465,10 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
   let chosenSection = '';
 
   if (isStage) {
-    // ستاج: مجلد ستاج فقط وبدون أي تفريعات داخله
     typeFolders = ['ستاج'];
   } else if (isPractical) {
-    // عملي: مجلد عملي فقط وبدون أي تفريعات داخله
     typeFolders = ['عملي'];
   } else if (isCourses) {
-    // دورات: تنزل بمجلد الدورات، وإن ذكر دكتور يُفرع له
     typeFolders = ['دورات'];
     for (const tag of tags) {
       const norm = normalizeArabic(tag);
@@ -458,24 +489,18 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
       }
     }
   } else {
-    // الافتراضي: نظري
+    // نظري
     typeFolders = ['نظري'];
 
-    // أ) مطابقة اسم الدكتور من سطر الدبوس أولاً
     if (pinInfo && pinInfo.doctorName) {
       const normPinDoc = normalizeArabic(pinInfo.doctorName);
       const matchedDoctor = selectedSubject.theory.find((doc) => {
         const normDoc = normalizeArabic(doc);
         return normDoc.includes(normPinDoc) || normPinDoc.includes(normDoc);
       });
-      if (matchedDoctor) {
-        chosenSection = matchedDoctor;
-      } else {
-        chosenSection = pinInfo.doctorName;
-      }
+      chosenSection = matchedDoctor || pinInfo.doctorName;
     }
 
-    // ب) إن لم يوجد بالدبوس، نبحث في الهاشتاقات أو نص الرسالة
     if (!chosenSection) {
       for (const tag of tags) {
         const norm = normalizeArabic(tag);
@@ -501,7 +526,7 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
     }
   }
 
-  // 5. بناء المسار (بدون مجلد الدفعة)
+  // 5. بناء المسار
   const finalPath = [];
   if (semester) finalPath.push(semester);
   finalPath.push(folderName);
@@ -513,7 +538,10 @@ async function determineFolderAndFileName(caption, originalFileName, defaultUser
 
   return {
     folderPath: finalPath,
-    fileName: finalFileName
+    fileName: finalFileName,
+    selectedSubject,
+    semester,
+    isFullyDetermined: Boolean(isStage || isPractical || isCourses || isExtra || pinInfo || chosenSection)
   };
 }
 
@@ -569,7 +597,7 @@ function getTelegramFileInfo(message) {
   if (message.document) {
     return {
       fileId: message.document.file_id,
-      fileName: message.document.file_name || `document_${Date.now()}`
+      fileName: message.document.file_name || `document_${Date.now()}.pdf`
     };
   }
   if (message.photo?.length) {
@@ -594,6 +622,70 @@ function getTelegramFileInfo(message) {
   return null;
 }
 
+// دالة توليد أزرار إدارة الملف بعد الرفع
+function getFileActionButtons(driveFileId, currentFolderId) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('✏️ إعادة تسمية', `ren:${driveFileId}`),
+      Markup.button.callback('📁 نقل لمجلد آخر', `mov:${driveFileId}`)
+    ],
+    [
+      Markup.button.callback('🗑️ حذف الملف نهائياً', `del:${driveFileId}`)
+    ]
+  ]);
+}
+
+// دالة تنفيذ الرفع إلى Google Drive
+async function executeUpload({ ctx, fileInfo, folderPath, fileName }) {
+  await ctx.reply(`⏳ جاري رفع الملف: ${fileName}...`);
+
+  enqueueUpload(async () => {
+    try {
+      const fileLink = await ctx.telegram.getFileLink(fileInfo.fileId);
+      const response = await axios.get(fileLink.href, {
+        responseType: 'arraybuffer',
+        timeout: 180000,
+        maxContentLength: 2 * 1024 * 1024 * 1024,
+        maxBodyLength: 2 * 1024 * 1024 * 1024
+      });
+
+      const fileBuffer = Buffer.from(response.data);
+      const folderId = await getOrCreateFolderPath(folderPath);
+
+      const uploaded = await drive.files.create({
+        requestBody: {
+          name: fileName,
+          parents: [folderId]
+        },
+        media: {
+          mimeType: response.headers['content-type'] || 'application/octet-stream',
+          body: Readable.from(fileBuffer)
+        },
+        fields: 'id,name,webViewLink'
+      });
+
+      const driveFileId = uploaded.data.id;
+      const fileUrl = uploaded.data.webViewLink ? `\n🔗 ${uploaded.data.webViewLink}` : '';
+
+      await ctx.reply(
+        `✅ تم رفع الملف بنجاح إلى Google Drive.\n` +
+        `📄 الملف: ${fileName}\n` +
+        `📂 المجلد: ${folderPath.join(' / ')}` +
+        fileUrl,
+        getFileActionButtons(driveFileId, folderId)
+      );
+    } catch (error) {
+      console.error('خطأ أثناء الرفع إلى Google Drive:', error?.stack || error);
+      try {
+        await ctx.reply('❌ فشل رفع الملف إلى Google Drive. يرجى مراجعة الصلاحيات وحجم الملف.');
+      } catch (replyError) {
+        console.error('تعذر إرسال رسالة الخطأ:', replyError?.message);
+      }
+    }
+  });
+}
+
+// استقبال الملفات
 bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
   if (shuttingDown) return;
 
@@ -601,12 +693,9 @@ bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
   const allowedUser = await isUserAllowed(senderId);
 
   if (!allowedUser) {
-    console.log(`تم رفض ملف من مستخدم غير مصرح له: ${senderId}`);
     try {
       await ctx.reply('⛔ عذرًا، أنت غير مصرح لك برفع الملفات عبر هذا البوت.');
-    } catch (err) {
-      console.error('تعذر إرسال رسالة الرفض:', err?.message);
-    }
+    } catch (_) {}
     return;
   }
 
@@ -633,59 +722,359 @@ bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
     return ctx.reply(`⚠️ تنبيه في التصنيف:\n${err.message}`);
   }
 
-  const { folderPath, fileName } = processPlan;
+  const { folderPath, fileName, selectedSubject, semester, isFullyDetermined } = processPlan;
+
+  // إذا أرسل المستخدم فقط هاشتاق المادة بدون تحديد نوع أو دكتور
+  if (!isFullyDetermined) {
+    const sessionId = `upl_${Date.now()}_${senderId}`;
+    userSessions.set(sessionId, {
+      fileInfo,
+      fileName,
+      selectedSubject,
+      semester,
+      expiresAt: Date.now() + 15 * 60 * 1000
+    });
+
+    const buttons = [
+      [
+        Markup.button.callback('📖 نظري', `btn_type:${sessionId}:نظري`),
+        Markup.button.callback('🏥 ستاج', `btn_type:${sessionId}:ستاج`)
+      ],
+      [
+        Markup.button.callback('📝 دورات', `btn_type:${sessionId}:دورات`),
+        Markup.button.callback('✨ اكسترا', `btn_type:${sessionId}:اكسترا`)
+      ],
+      [
+        Markup.button.callback('❌ إلغاء', `btn_cancel:${sessionId}`)
+      ]
+    ];
+
+    return ctx.reply(
+      `📚 تم تحديد مادة: *${selectedSubject.folderName}*\n` +
+      `يرجى اختيار القسم المراد رفع الملف إليه:`,
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+    );
+  }
+
+  // رفع مباشر إذا كانت البيانات مكتملة
+  await executeUpload({ ctx, fileInfo, folderPath, fileName });
+});
+
+// التعامل مع أزرار تحديد النوع قبل الرفع
+bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const sessionId = ctx.match[1];
+  const typeChosen = ctx.match[2];
+
+  const session = userSessions.get(sessionId);
+  if (!session) {
+    return ctx.editMessageText('⚠️ انتهت صلاحية هذه الجلسة، يرجى إعادة إرسال الملف.');
+  }
+
+  const { selectedSubject, semester, fileInfo, fileName } = session;
+
+  // ستاج أو عملي يرفع مباشرة دون تفريعات
+  if (typeChosen === 'ستاج' || typeChosen === 'عملي') {
+    userSessions.delete(sessionId);
+    await ctx.editMessageText(`✅ تم اختيار قسم: ${typeChosen}، جاري الرفع...`);
+    const finalPath = [semester, selectedSubject.folderName, typeChosen].filter(Boolean);
+    return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName });
+  }
+
+  // نظري أو دورات أو إكسترا: إظهار أسماء الدكاترة إن وجدت
+  let doctorsList = [];
+  if (typeChosen === 'نظري') doctorsList = selectedSubject.theory;
+  else if (typeChosen === 'دورات') doctorsList = selectedSubject.courses;
+  else if (typeChosen === 'اكسترا') doctorsList = selectedSubject.extra;
+
+  if (!doctorsList || doctorsList.length === 0) {
+    userSessions.delete(sessionId);
+    await ctx.editMessageText(`✅ تم اختيار قسم: ${typeChosen}، جاري الرفع...`);
+    const finalPath = [semester, selectedSubject.folderName, typeChosen].filter(Boolean);
+    return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName });
+  }
+
+  session.typeChosen = typeChosen;
+  const docButtons = [];
+  for (let i = 0; i < doctorsList.length; i += 2) {
+    const row = [Markup.button.callback(doctorsList[i], `btn_doc:${sessionId}:${i}`)];
+    if (doctorsList[i + 1]) {
+      row.push(Markup.button.callback(doctorsList[i + 1], `btn_doc:${sessionId}:${i + 1}`));
+    }
+    docButtons.push(row);
+  }
+
+  docButtons.push([
+    Markup.button.callback('📁 عام / بدون دكتور', `btn_doc:${sessionId}:none`),
+    Markup.button.callback('❌ إلغاء', `btn_cancel:${sessionId}`)
+  ]);
+
+  await ctx.editMessageText(
+    `📂 القسم: *${typeChosen}*\nاختر اسم الدكتور أو القسم الفرعي:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(docButtons) }
+  );
+});
+
+// التعامل مع اختيار الدكتور
+bot.action(/^btn_doc:(.+):(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const sessionId = ctx.match[1];
+  const docIndex = ctx.match[2];
+
+  const session = userSessions.get(sessionId);
+  if (!session) {
+    return ctx.editMessageText('⚠️ انتهت صلاحية هذه الجلسة، يرجى إعادة إرسال الملف.');
+  }
+
+  const { selectedSubject, semester, typeChosen, fileInfo, fileName } = session;
+  userSessions.delete(sessionId);
+
+  let chosenDoc = '';
+  if (docIndex !== 'none') {
+    let list = selectedSubject.theory;
+    if (typeChosen === 'دورات') list = selectedSubject.courses;
+    else if (typeChosen === 'اكسترا') list = selectedSubject.extra;
+
+    chosenDoc = list[Number(docIndex)] || '';
+  }
+
+  await ctx.editMessageText(`✅ تم اعتماد المسار، جاري الرفع إلى Google Drive...`);
+  const finalPath = [semester, selectedSubject.folderName, typeChosen, chosenDoc].filter(Boolean);
+  return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName });
+});
+
+// زر الإلغاء
+bot.action(/^btn_cancel:(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('تم الإلغاء');
+  const sessionId = ctx.match[1];
+  userSessions.delete(sessionId);
+  await ctx.editMessageText('❌ تم إلغاء عملية رفع الملف.');
+});
+
+// ==========================================
+// 1. زر حذف الملف
+// ==========================================
+bot.action(/^del:(.+)$/, async (ctx) => {
+  const fileId = ctx.match[1];
+  await ctx.answerCbQuery('جاري الحذف...');
+
+  try {
+    await drive.files.delete({ fileId });
+    await ctx.editMessageText('🗑️ تم حذف الملف بنجاح من Google Drive.');
+  } catch (error) {
+    console.error('خطأ أثناء حذف الملف:', error?.message);
+    await ctx.reply('❌ تعذر حذف الملف من Google Drive. قد يكون قد حُذف مسبقاً.');
+  }
+});
+
+// ==========================================
+// 2. زر إعادة تسمية الملف
+// ==========================================
+bot.action(/^ren:(.+)$/, async (ctx) => {
+  const fileId = ctx.match[1];
+  await ctx.answerCbQuery();
+
+  const userId = String(ctx.from.id);
+  userSessions.set(`wait_rename_${userId}`, {
+    fileId,
+    msgId: ctx.callbackQuery.message.message_id,
+    expiresAt: Date.now() + 5 * 60 * 1000
+  });
 
   await ctx.reply(
-    `⏳ تم استلام الملف:\n` +
-    `📄 الاسم المعتمد: ${fileName}\n` +
-    `📂 المسار: ${folderPath.join(' / ')}`
+    '✏️ أرسل الآن الاسم الجديد للملف في الدردشة (يمكنك إرسال الاسم بدون .pdf وسيتكفل البوت بإضافتها):',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('❌ إلغاء التسمية', `cancel_rename_${userId}`)]
+    ])
   );
-
-  enqueueUpload(async () => {
-    try {
-      await ctx.reply('⬆️ جاري الرفع إلى Google Drive...');
-
-      const fileLink = await ctx.telegram.getFileLink(fileInfo.fileId);
-      const response = await axios.get(fileLink.href, {
-        responseType: 'arraybuffer',
-        timeout: 180000,
-        maxContentLength: 2 * 1024 * 1024 * 1024,
-        maxBodyLength: 2 * 1024 * 1024 * 1024
-      });
-
-      const fileBuffer = Buffer.from(response.data);
-      const folderId = await getOrCreateFolderPath(folderPath);
-
-      const uploaded = await drive.files.create({
-        requestBody: {
-          name: fileName,
-          parents: [folderId]
-        },
-        media: {
-          mimeType: response.headers['content-type'] || 'application/octet-stream',
-          body: Readable.from(fileBuffer)
-        },
-        fields: 'id,name,webViewLink'
-      });
-
-      const fileUrl = uploaded.data.webViewLink ? `\n🔗 ${uploaded.data.webViewLink}` : '';
-
-      await ctx.reply(
-        `✅ تم رفع الملف بنجاح إلى Google Drive.\n` +
-        `📄 الملف: ${fileName}\n` +
-        `📂 المجلد: ${folderPath.join(' / ')}` +
-        fileUrl
-      );
-    } catch (error) {
-      console.error('خطأ أثناء الرفع إلى Google Drive:', error?.stack || error);
-      try {
-        await ctx.reply('❌ فشل رفع الملف إلى Google Drive. يرجى مراجعة الصلاحيات أو المحاولة لاحقاً.');
-      } catch (replyError) {
-        console.error('تعذر إرسال رسالة الخطأ:', replyError?.message);
-      }
-    }
-  });
 });
+
+bot.action(/^cancel_rename_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('تم الإلغاء');
+  const userId = ctx.match[1];
+  userSessions.delete(`wait_rename_${userId}`);
+  await ctx.editMessageText('❌ تم إلغاء عملية إعادة التسمية.');
+});
+
+// استقبال الاسم الجديد كنص
+bot.on('text', async (ctx, next) => {
+  const userId = String(ctx.from.id);
+  const renameState = userSessions.get(`wait_rename_${userId}`);
+
+  if (!renameState) return next();
+
+  userSessions.delete(`wait_rename_${userId}`);
+  let newName = ctx.message.text.trim();
+
+  if (!path.extname(newName)) {
+    newName += '.pdf';
+  }
+
+  try {
+    await drive.files.update({
+      fileId: renameState.fileId,
+      requestBody: { name: newName }
+    });
+
+    await ctx.reply(`✅ تم تعديل اسم الملف بنجاح إلى:\n📄 ${newName}`);
+  } catch (error) {
+    console.error('خطأ أثناء تعديل اسم الملف:', error?.message);
+    await ctx.reply('❌ فشل تعديل اسم الملف على Google Drive.');
+  }
+});
+
+// ==========================================
+// 3. زر نقل الملف لمجلد آخر
+// ==========================================
+bot.action(/^mov:(.+)$/, async (ctx) => {
+  const fileId = ctx.match[1];
+  await ctx.answerCbQuery();
+
+  const subjects = await getSubjectsData();
+  const subButtons = [];
+
+  for (let i = 0; i < subjects.length; i += 2) {
+    const row = [Markup.button.callback(subjects[i].folderName, `mov_sub:${fileId}:${i}`)];
+    if (subjects[i + 1]) {
+      row.push(Markup.button.callback(subjects[i + 1].folderName, `mov_sub:${fileId}:${i + 1}`));
+    }
+    subButtons.push(row);
+  }
+
+  subButtons.push([Markup.button.callback('❌ إلغاء النقل', `mov_cancel`)]);
+
+  await ctx.reply(
+    '📁 اختر المادة التي تريد نقل الملف إليها:',
+    Markup.inlineKeyboard(subButtons)
+  );
+});
+
+bot.action(/^mov_sub:(.+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const fileId = ctx.match[1];
+  const subIdx = Number(ctx.match[2]);
+
+  const subjects = await getSubjectsData();
+  const selectedSubject = subjects[subIdx];
+  if (!selectedSubject) return ctx.editMessageText('⚠️ مادة غير صالحة.');
+
+  const typeButtons = [
+    [
+      Markup.button.callback('📖 نظري', `mov_type:${fileId}:${subIdx}:نظري`),
+      Markup.button.callback('🏥 ستاج', `mov_type:${fileId}:${subIdx}:ستاج`)
+    ],
+    [
+      Markup.button.callback('📝 دورات', `mov_type:${fileId}:${subIdx}:دورات`),
+      Markup.button.callback('✨ اكسترا', `mov_type:${fileId}:${subIdx}:اكسترا`)
+    ],
+    [Markup.button.callback('❌ إلغاء', `mov_cancel`)]
+  ];
+
+  await ctx.editMessageText(
+    `📂 تم اختيار: *${selectedSubject.folderName}*\nاختر القسم الجديد:`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(typeButtons) }
+  );
+});
+
+bot.action(/^mov_type:(.+):(\d+):(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const fileId = ctx.match[1];
+  const subIdx = Number(ctx.match[2]);
+  const typeChosen = ctx.match[3];
+
+  const subjects = await getSubjectsData();
+  const selectedSubject = subjects[subIdx];
+  const semester = selectedSubject.semester || 'الفصل الأول';
+
+  let doctorsList = [];
+  if (typeChosen === 'نظري') doctorsList = selectedSubject.theory;
+  else if (typeChosen === 'دورات') doctorsList = selectedSubject.courses;
+  else if (typeChosen === 'اكسترا') doctorsList = selectedSubject.extra;
+
+  // نقل مباشر للستاج والعملي أو إذا لم يكن هناك دكاترة
+  if (typeChosen === 'ستاج' || typeChosen === 'عملي' || doctorsList.length === 0) {
+    const finalPath = [semester, selectedSubject.folderName, typeChosen].filter(Boolean);
+    return executeMoveFile(ctx, fileId, finalPath);
+  }
+
+  const docButtons = [];
+  for (let i = 0; i < doctorsList.length; i += 2) {
+    const row = [Markup.button.callback(doctorsList[i], `mov_final:${fileId}:${subIdx}:${typeChosen}:${i}`)];
+    if (doctorsList[i + 1]) {
+      row.push(Markup.button.callback(doctorsList[i + 1], `mov_final:${fileId}:${subIdx}:${typeChosen}:${i + 1}`));
+    }
+    docButtons.push(row);
+  }
+
+  docButtons.push([
+    Markup.button.callback('📁 بدون تفريع دكتور', `mov_final:${fileId}:${subIdx}:${typeChosen}:none`),
+    Markup.button.callback('❌ إلغاء', `mov_cancel`)
+  ]);
+
+  await ctx.editMessageText(
+    `اختر الدكتور للقسم الجديد:`,
+    Markup.inlineKeyboard(docButtons)
+  );
+});
+
+bot.action(/^mov_final:(.+):(\d+):(.+):(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const fileId = ctx.match[1];
+  const subIdx = Number(ctx.match[2]);
+  const typeChosen = ctx.match[3];
+  const docIdx = ctx.match[4];
+
+  const subjects = await getSubjectsData();
+  const selectedSubject = subjects[subIdx];
+  const semester = selectedSubject.semester || 'الفصل الأول';
+
+  let chosenDoc = '';
+  if (docIdx !== 'none') {
+    let list = selectedSubject.theory;
+    if (typeChosen === 'دورات') list = selectedSubject.courses;
+    else if (typeChosen === 'اكسترا') list = selectedSubject.extra;
+
+    chosenDoc = list[Number(docIdx)] || '';
+  }
+
+  const finalPath = [semester, selectedSubject.folderName, typeChosen, chosenDoc].filter(Boolean);
+  return executeMoveFile(ctx, fileId, finalPath);
+});
+
+bot.action('mov_cancel', async (ctx) => {
+  await ctx.answerCbQuery('تم الإلغاء');
+  await ctx.editMessageText('❌ تم إلغاء عملية النقل.');
+});
+
+// تنفيذ نقل الملف في Google Drive
+async function executeMoveFile(ctx, fileId, targetFolderPath) {
+  try {
+    await ctx.editMessageText('⏳ جاري نقل الملف إلى المجلد الجديد...');
+    const targetFolderId = await getOrCreateFolderPath(targetFolderPath);
+
+    const fileMeta = await drive.files.get({
+      fileId,
+      fields: 'parents'
+    });
+
+    const previousParents = (fileMeta.data.parents || []).join(',');
+
+    await drive.files.update({
+      fileId,
+      addParents: targetFolderId,
+      removeParents: previousParents,
+      fields: 'id, parents'
+    });
+
+    await ctx.editMessageText(
+      `✅ تم نقل الملف بنجاح!\n` +
+      `📂 المسار الجديد: ${targetFolderPath.join(' / ')}`
+    );
+  } catch (error) {
+    console.error('خطأ أثناء نقل الملف:', error?.message);
+    await ctx.editMessageText('❌ فشل نقل الملف في Google Drive.');
+  }
+}
 
 bot.catch((error) => {
   console.error('خطأ عام في Telegram bot:', error?.stack || error);
@@ -726,7 +1115,7 @@ function startHealthServer() {
 async function startBot() {
   try {
     await bot.launch({ dropPendingUpdates: false });
-    console.log('🤖 Telegram bot is running successfully.');
+    console.log('🤖 Telegram bot is running successfully with Action Buttons.');
   } catch (error) {
     console.error('فشل تشغيل البوت:', error?.stack || error);
     process.exit(1);
