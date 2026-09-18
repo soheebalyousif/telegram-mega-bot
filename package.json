@@ -1,13 +1,14 @@
 {
-  "name": "telegram-mega-bot",
+  "name": "telegram-google-drive-bot",
   "version": "1.0.0",
+  "description": "Telegram bot that uploads files to Google Drive",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "axios": "^1.7.0",
-    "megajs": "^1.1.0",
+    "googleapis": "^144.0.0",
     "telegraf": "^4.16.3"
   }
 }
