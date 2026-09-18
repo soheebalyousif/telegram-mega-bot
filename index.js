@@ -3,6 +3,7 @@ const axios = require('axios');
 const http = require('http');
 const { google } = require('googleapis');
 const { Readable } = require('stream');
+const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -10,7 +11,9 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID || 'root';
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const GOOGLE_SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || '';
+
+const USERS_SHEET_NAME = process.env.USERS_SHEET_NAME || '';
+const SUBJECTS_SHEET_NAME = process.env.SUBJECTS_SHEET_NAME || '';
 
 if (
   !BOT_TOKEN ||
@@ -19,9 +22,7 @@ if (
   !GOOGLE_REFRESH_TOKEN ||
   !GOOGLE_SHEET_ID
 ) {
-  console.error(
-    'الرجاء تعبئة BOT_TOKEN وبيانات Google OAuth و GOOGLE_SHEET_ID.'
-  );
+  console.error('الرجاء تعبئة جميع المتغيرات المطلوبة (BOT_TOKEN, Google OAuth, GOOGLE_SHEET_ID).');
   process.exit(1);
 }
 
@@ -35,15 +36,8 @@ oauth2Client.setCredentials({
   refresh_token: GOOGLE_REFRESH_TOKEN
 });
 
-const drive = google.drive({
-  version: 'v3',
-  auth: oauth2Client
-});
-
-const sheets = google.sheets({
-  version: 'v4',
-  auth: oauth2Client
-});
+const drive = google.drive({ version: 'v3', auth: oauth2Client });
+const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 
 let shuttingDown = false;
 let uploadQueue = Promise.resolve();
@@ -51,10 +45,16 @@ let healthServer = null;
 const folderCache = new Map();
 const handledMessages = new Set();
 const MAX_HANDLED_MESSAGES = 5000;
+
+// Caches
 let allowedUsersCache = new Map();
 let allowedUsersCacheAt = 0;
-const SHEET_CACHE_TTL_MS = 60 * 1000;
-let resolvedSheetRange = null;
+let subjectsCache = [];
+let subjectsCacheAt = 0;
+const CACHE_TTL_MS = 60 * 1000; // تحديث الكاش كل دقيقة
+
+let resolvedUsersSheetTitle = null;
+let resolvedSubjectsSheetTitle = null;
 
 function enqueueUpload(task) {
   const result = uploadQueue.then(task, task);
@@ -62,63 +62,17 @@ function enqueueUpload(task) {
   return result;
 }
 
-async function getAllowedUsers() {
-  const now = Date.now();
-  if (now - allowedUsersCacheAt < SHEET_CACHE_TTL_MS) {
-    return allowedUsersCache;
-  }
-
-  if (!resolvedSheetRange) {
-    if (GOOGLE_SHEET_RANGE) {
-      resolvedSheetRange = GOOGLE_SHEET_RANGE;
-    } else {
-      const spreadsheet = await sheets.spreadsheets.get({
-        spreadsheetId: GOOGLE_SHEET_ID,
-        fields: 'sheets.properties.title'
-      });
-      const firstSheetTitle = spreadsheet.data.sheets?.[0]?.properties?.title;
-
-      if (!firstSheetTitle) {
-        throw new Error('لم يتم العثور على أي تبويب داخل Google Sheet.');
-      }
-
-      const escapedTitle = firstSheetTitle.replace(/'/g, "''");
-      resolvedSheetRange = `'${escapedTitle}'!A2:C`;
-    }
-  }
-
-  const result = await sheets.spreadsheets.values.get({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: resolvedSheetRange,
-    majorDimension: 'ROWS'
-  });
-
-  const users = new Map();
-  for (const row of result.data.values || []) {
-    const telegramId = String(row[0] || '').trim();
-    const name = String(row[1] || '').trim();
-    const active = String(row[2] || '').trim().toLowerCase();
-    const isActive = ['yes', 'true', '1', 'نعم', 'فعال', 'مفعل'].includes(active);
-
-    if (telegramId && isActive) {
-      users.set(telegramId, name || telegramId);
-    }
-  }
-
-  allowedUsersCache = users;
-  allowedUsersCacheAt = now;
-  return users;
-}
-
-async function isUserAllowed(userId) {
-  try {
-    const allowedUsers = await getAllowedUsers();
-    return allowedUsers.has(String(userId));
-  } catch (error) {
-    // رفض آمن عند تعذر الوصول إلى الجدول بدل السماح للجميع.
-    console.error('تعذر قراءة Google Sheet للصلاحيات:', error?.message || error);
-    return false;
-  }
+// تطبيع النصوص العربية لمطابقة ذكية
+function normalizeArabic(str) {
+  return String(str || '')
+    .trim()
+    .replace(/^#+/, '')
+    .replace(/_/g, ' ')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
 }
 
 function sanitizeFolderName(name) {
@@ -135,76 +89,439 @@ function sanitizeFolderName(name) {
   return cleaned || 'Others';
 }
 
-function normalizeTag(tag) {
-  return tag
-    .replace(/^#/, '')
-    .replace(/_/g, ' ')
-    .replace(/\s+/g, ' ')
+// تحويل الأرقام العربية النصية (مثل: الحادية والعشرون) إلى أرقام رقمية (21)
+function parseArabicLectureNumber(text) {
+  if (!text) return '';
+  const digitsOnly = text.match(/\d+/);
+  if (digitsOnly) return digitsOnly[0];
+
+  const norm = normalizeArabic(text);
+
+  const units = {
+    'حادي': 1, 'حاديه': 1, 'اول': 1, 'اولي': 1,
+    'ثاني': 2, 'ثانيه': 2,
+    'ثالث': 3, 'ثالثه': 3,
+    'رابع': 4, 'رابعه': 4,
+    'خامس': 5, 'خامسه': 5,
+    'سادس': 6, 'سادسه': 6,
+    'سابع': 7, 'سابعه': 7,
+    'ثامن': 8, 'ثامنه': 8,
+    'تاسع': 9, 'تاسعه': 9,
+    'عاشر': 10, 'عاشره': 10
+  };
+
+  const tens = {
+    'عشر': 10, 'عشره': 10,
+    'عشرون': 20, 'عشرين': 20,
+    'ثلاثون': 30, 'ثلاثين': 30,
+    'اربعون': 40, 'اربعين': 40,
+    'خمسون': 50, 'خمسين': 50
+  };
+
+  // فحص المركبات مثل (الحادية عشرة، الثانية عشرة)
+  for (const [uWord, uVal] of Object.entries(units)) {
+    if (uVal < 10 && (norm.includes(`${uWord} عشر`) || norm.includes(`${uWord} عشره`))) {
+      return String(10 + uVal);
+    }
+  }
+
+  // فحص العقود مع الواو مثل (الحادية والعشرون)
+  let foundUnit = 0;
+  let foundTen = 0;
+
+  for (const [uWord, uVal] of Object.entries(units)) {
+    if (norm.includes(uWord)) {
+      foundUnit = uVal;
+      break;
+    }
+  }
+
+  for (const [tWord, tVal] of Object.entries(tens)) {
+    if (norm.includes(tWord) && tVal >= 20) {
+      foundTen = tVal;
+      break;
+    }
+  }
+
+  if (foundTen > 0) {
+    return String(foundTen + foundUnit);
+  }
+
+  if (foundUnit > 0) {
+    return String(foundUnit);
+  }
+
+  return '';
+}
+
+// تحليل سطر الدبوس 📌
+function parsePinLine(caption) {
+  if (!caption) return null;
+  const lines = caption.split('\n');
+  const pinLine = lines.find((l) => l.includes('📌') || (l.includes('المحاضرة') && l.includes('-')));
+  if (!pinLine) return null;
+
+  const clean = pinLine.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+  const parts = clean.split('-').map((p) => p.trim());
+  if (parts.length < 2) return null;
+
+  const lecturePart = parts[0] || '';
+  const titlePart = parts[1] || '';
+  const doctorPart = parts.length >= 3 ? parts[2] : '';
+
+  const lecNum = parseArabicLectureNumber(lecturePart);
+  const cleanTitle = titlePart.replace(/[\\/:*?"<>|]/g, '').trim();
+  const cleanDoctor = doctorPart
+    .replace(/^(د\.?|الدكتور|الدكتورة)\s*/i, '')
+    .replace(/[\\/:*?"<>|.]/g, '')
     .trim();
+
+  return {
+    lectureNumber: lecNum,
+    title: cleanTitle,
+    doctorName: cleanDoctor
+  };
 }
 
-function isExtraTag(tag) {
-  const compact = tag.replace(/\s+/g, '');
-  return compact.startsWith('اكسترا') || compact.startsWith('إكسترا');
+async function resolveSheetTitles() {
+  if (resolvedUsersSheetTitle && resolvedSubjectsSheetTitle) return;
+
+  const spreadsheet = await sheets.spreadsheets.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    fields: 'sheets.properties.title'
+  });
+
+  const allSheets = spreadsheet.data.sheets || [];
+  if (allSheets.length === 0) {
+    throw new Error('لم يتم العثور على أي تبويب داخل Google Sheet.');
+  }
+
+  resolvedUsersSheetTitle = USERS_SHEET_NAME || allSheets[0]?.properties?.title || 'users';
+
+  if (SUBJECTS_SHEET_NAME) {
+    resolvedSubjectsSheetTitle = SUBJECTS_SHEET_NAME;
+  } else if (allSheets.length > 1) {
+    resolvedSubjectsSheetTitle = allSheets[1]?.properties?.title;
+  } else {
+    resolvedSubjectsSheetTitle = 'subjects';
+  }
 }
 
-function isPracticalTag(tag) {
-  const compact = tag.replace(/\s+/g, '');
-  return compact === 'عملي' || compact === 'العملي';
+async function getAllowedUsers() {
+  const now = Date.now();
+  if (now - allowedUsersCacheAt < CACHE_TTL_MS && allowedUsersCache.size > 0) {
+    return allowedUsersCache;
+  }
+
+  await resolveSheetTitles();
+  const escapedTitle = resolvedUsersSheetTitle.replace(/'/g, "''");
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `'${escapedTitle}'!A2:D`,
+    majorDimension: 'ROWS'
+  });
+
+  const users = new Map();
+  for (const row of result.data.values || []) {
+    const telegramId = String(row[0] || '').trim();
+    const name = String(row[1] || '').trim();
+    const active = String(row[2] || '').trim().toLowerCase();
+    const section = String(row[3] || '').trim();
+    const isActive = ['yes', 'true', '1', 'نعم', 'فعال', 'مفعل'].includes(active);
+
+    if (telegramId && isActive) {
+      users.set(telegramId, {
+        name: name || telegramId,
+        section: section ? sanitizeFolderName(section) : ''
+      });
+    }
+  }
+
+  allowedUsersCache = users;
+  allowedUsersCacheAt = now;
+  return users;
 }
 
-function extractFolderPathFromCaption(caption, fileName) {
-  const hashtags = String(caption || '').match(/#[\p{L}\p{N}_]+/gu) || [];
-  const tags = hashtags.map(normalizeTag);
+async function getSubjectsData() {
+  const now = Date.now();
+  if (now - subjectsCacheAt < CACHE_TTL_MS && subjectsCache.length > 0) {
+    return subjectsCache;
+  }
 
-  // حسب تنسيق رسائلك: الهاشتاق الأول هو اسم المادة دائمًا.
-  const subjectFolder = sanitizeFolderName(
-    tags[0] || getFolderByExtension(fileName)
+  await resolveSheetTitles();
+  const escapedTitle = resolvedSubjectsSheetTitle.replace(/'/g, "''");
+
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `'${escapedTitle}'!A1:ZZ`,
+    majorDimension: 'ROWS'
+  });
+
+  const rows = result.data.values || [];
+  if (rows.length < 2) {
+    subjectsCache = [];
+    subjectsCacheAt = now;
+    return subjectsCache;
+  }
+
+  const headers = rows[0].map((h) => String(h || '').trim().toLowerCase());
+
+  const hashtagIdx = headers.indexOf('hashtag');
+  const folderNameIdx = headers.indexOf('folder_name');
+  const batchIdx = headers.indexOf('batch');
+  const semesterIdx = headers.indexOf('semester');
+
+  const parsed = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const hashtag = String(row[hashtagIdx] !== undefined ? row[hashtagIdx] : '').trim();
+    const folderName = String(row[folderNameIdx] !== undefined ? row[folderNameIdx] : '').trim();
+    let batch = String(row[batchIdx] !== undefined ? row[batchIdx] : '').trim();
+    let semester = String(row[semesterIdx] !== undefined ? row[semesterIdx] : '').trim();
+
+    if (!hashtag && !folderName) continue;
+
+    batch = batch.replace(/[^\d]/g, '');
+
+    if (/ثان|2/i.test(semester)) {
+      semester = 'الفصل الثاني';
+    } else if (/اول|أول|1/i.test(semester)) {
+      semester = 'الفصل الأول';
+    }
+
+    const theorySections = [];
+    const extraSections = [];
+    const coursesSections = [];
+
+    headers.forEach((header, colIdx) => {
+      const val = String(row[colIdx] || '').trim();
+      if (!val) return;
+
+      const parts = val.split(/[،,]/).map((p) => p.trim()).filter(Boolean);
+
+      if (header.startsWith('theory')) {
+        theorySections.push(...parts);
+      } else if (header.startsWith('extra')) {
+        extraSections.push(...parts);
+      } else if (header.startsWith('course')) {
+        coursesSections.push(...parts);
+      }
+    });
+
+    parsed.push({
+      hashtag,
+      normHashtag: normalizeArabic(hashtag),
+      folderName: folderName || hashtag,
+      batch,
+      semester,
+      theory: [...new Set(theorySections)],
+      extra: [...new Set(extraSections)],
+      courses: [...new Set(coursesSections)]
+    });
+  }
+
+  subjectsCache = parsed;
+  subjectsCacheAt = now;
+  return subjectsCache;
+}
+
+async function isUserAllowed(userId) {
+  try {
+    const allowedUsers = await getAllowedUsers();
+    return allowedUsers.get(String(userId)) || null;
+  } catch (error) {
+    console.error('تعذر قراءة المستخدمين من الشيت:', error?.message || error);
+    return null;
+  }
+}
+
+function extractTags(caption) {
+  const matches = String(caption || '').match(/#[\p{L}\p{N}_]+/gu) || [];
+  return matches.map((t) => t.replace(/^#/, '').trim());
+}
+
+async function determineFolderAndFileName(caption, originalFileName, defaultUserSection = '') {
+  const tags = extractTags(caption);
+  const normTags = tags.map(normalizeArabic);
+  const fullTextNorm = normalizeArabic(caption);
+  const subjects = await getSubjectsData();
+
+  // 1. تحديد المادة
+  let matchedRows = [];
+  let subjectTag = '';
+
+  for (const tag of tags) {
+    const norm = normalizeArabic(tag);
+    const matches = subjects.filter(
+      (s) => s.normHashtag === norm || s.folderName.toLowerCase() === tag.toLowerCase()
+    );
+    if (matches.length > 0) {
+      matchedRows = matches;
+      subjectTag = tag;
+      break;
+    }
+  }
+
+  // إذا لم يجد في الهاشتاقات، يبحث في نص الرسالة بالكامل
+  if (matchedRows.length === 0) {
+    for (const sub of subjects) {
+      if (fullTextNorm.includes(sub.normHashtag)) {
+        matchedRows = [sub];
+        subjectTag = sub.hashtag;
+        break;
+      }
+    }
+  }
+
+  if (matchedRows.length === 0) {
+    throw new Error(
+      `لم يتم التعرف على اسم المادة في الرسالة.\nتأكد من كتابة هاشتاق المادة الصحيح (مثل #الاحياء_الدقيقة أو #الباطنة_الغدية).`
+    );
+  }
+
+  // 2. تصفية الفصل
+  let semester = '';
+  const isSem1 = normTags.some((t) => t.includes('اول') || t === '1' || t === 'فصل 1');
+  const isSem2 = normTags.some((t) => t.includes('ثان') || t === '2' || t === 'فصل 2');
+
+  if (isSem1) semester = 'الفصل الأول';
+  if (isSem2) semester = 'الفصل الثاني';
+
+  if (semester) {
+    const filtered = matchedRows.filter((r) => r.semester === semester);
+    if (filtered.length > 0) matchedRows = filtered;
+  } else {
+    const uniqueSemesters = [...new Set(matchedRows.map((r) => r.semester).filter(Boolean))];
+    if (uniqueSemesters.length === 1) {
+      semester = uniqueSemesters[0];
+    } else if (uniqueSemesters.length > 1) {
+      throw new Error(`المادة "${subjectTag}" متوفرة بالفصلين. يرجى كتابة الهاشتاق: #الفصل_الأول أو #الفصل_الثاني`);
+    }
+  }
+
+  const selectedSubject = matchedRows[0];
+  const folderName = selectedSubject.folderName;
+
+  // 3. فحص سطر الدبوس 📌 (لاستخراج الدكتور وتسمية الملف إن وُجد)
+  const pinInfo = parsePinLine(caption);
+
+  // حساب اسم الملف
+  let finalFileName = originalFileName;
+  const ext = path.extname(originalFileName) || '.pdf';
+
+  if (pinInfo && pinInfo.title) {
+    if (pinInfo.lectureNumber) {
+      finalFileName = `${pinInfo.lectureNumber} - ${pinInfo.title}${ext}`;
+    } else {
+      finalFileName = `${pinInfo.title}${ext}`;
+    }
+  }
+
+  // 4. تحديد النوع الرئيسي (ستاج، عملي، دورات، إكسترا، نظري)
+  const isStage = normTags.some((t) => t.includes('ستاج') || t.includes('اوسكي'));
+  const isPractical = normTags.some((t) => t.includes('عملي'));
+  const isCourses = normTags.some(
+    (t) => t.includes('دورات') || t.includes('دوره') || t.includes('اسئله دورات')
   );
+  const isExtra = normTags.some((t) => t.includes('اكسترا'));
 
-  const isExtra = tags.some(isExtraTag);
-  const isPractical = tags.some(isPracticalTag);
+  let typeFolders = [];
+  let chosenSection = '';
 
-  if (isPractical) {
-    return [subjectFolder, 'عملي', ...(isExtra ? ['اكسترا'] : [])];
+  if (isStage) {
+    // ستاج: مجلد ستاج فقط وبدون أي تفريعات داخله
+    typeFolders = ['ستاج'];
+  } else if (isPractical) {
+    // عملي: مجلد عملي فقط وبدون أي تفريعات داخله
+    typeFolders = ['عملي'];
+  } else if (isCourses) {
+    // دورات: تنزل بمجلد الدورات، وإن ذكر دكتور يُفرع له
+    typeFolders = ['دورات'];
+    for (const tag of tags) {
+      const norm = normalizeArabic(tag);
+      const found = selectedSubject.courses.find((sec) => normalizeArabic(sec) === norm);
+      if (found && normalizeArabic(found) !== 'عام') {
+        chosenSection = found;
+        break;
+      }
+    }
+  } else if (isExtra) {
+    typeFolders = ['اكسترا'];
+    for (const tag of tags) {
+      const norm = normalizeArabic(tag);
+      const found = selectedSubject.extra.find((sec) => normalizeArabic(sec) === norm);
+      if (found && normalizeArabic(found) !== 'عام') {
+        chosenSection = found;
+        break;
+      }
+    }
+  } else {
+    // الافتراضي: نظري
+    typeFolders = ['نظري'];
+
+    // أ) مطابقة اسم الدكتور من سطر الدبوس أولاً
+    if (pinInfo && pinInfo.doctorName) {
+      const normPinDoc = normalizeArabic(pinInfo.doctorName);
+      const matchedDoctor = selectedSubject.theory.find((doc) => {
+        const normDoc = normalizeArabic(doc);
+        return normDoc.includes(normPinDoc) || normPinDoc.includes(normDoc);
+      });
+      if (matchedDoctor) {
+        chosenSection = matchedDoctor;
+      } else {
+        chosenSection = pinInfo.doctorName;
+      }
+    }
+
+    // ب) إن لم يوجد بالدبوس، نبحث في الهاشتاقات أو نص الرسالة
+    if (!chosenSection) {
+      for (const tag of tags) {
+        const norm = normalizeArabic(tag);
+        const found = selectedSubject.theory.find((sec) => normalizeArabic(sec) === norm);
+        if (found) {
+          chosenSection = found;
+          break;
+        }
+      }
+    }
+
+    if (!chosenSection) {
+      for (const doc of selectedSubject.theory) {
+        if (fullTextNorm.includes(normalizeArabic(doc))) {
+          chosenSection = doc;
+          break;
+        }
+      }
+    }
+
+    if (!chosenSection && defaultUserSection) {
+      chosenSection = defaultUserSection;
+    }
   }
 
-  if (isExtra) {
-    return [subjectFolder, 'اكسترا'];
+  // 5. بناء المسار (بدون مجلد الدفعة)
+  const finalPath = [];
+  if (semester) finalPath.push(semester);
+  finalPath.push(folderName);
+  finalPath.push(...typeFolders);
+
+  if (chosenSection) {
+    finalPath.push(chosenSection);
   }
 
-  return [subjectFolder, 'نظري'];
-}
-
-function getFolderByExtension(fileName) {
-  const ext = String(fileName).split('.').pop().toLowerCase();
-
-  if (['pdf', 'doc', 'docx', 'txt', 'epub', 'xls', 'xlsx', 'ppt', 'pptx'].includes(ext)) {
-    return 'Documents';
-  }
-  if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic'].includes(ext)) {
-    return 'Images';
-  }
-  if (['mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac'].includes(ext)) {
-    return 'Audios';
-  }
-  if (['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) {
-    return 'Videos';
-  }
-  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) {
-    return 'Archives';
-  }
-
-  return 'Others';
+  return {
+    folderPath: finalPath,
+    fileName: finalFileName
+  };
 }
 
 async function getOrCreateFolderPath(folderNames) {
   let parentId = GOOGLE_DRIVE_FOLDER_ID;
-  const path = [];
 
   for (const rawName of folderNames) {
     const folderName = sanitizeFolderName(rawName);
-    path.push(folderName);
     const cacheKey = `${parentId}/${folderName}`;
 
     if (folderCache.has(cacheKey)) {
@@ -255,7 +572,6 @@ function getTelegramFileInfo(message) {
       fileName: message.document.file_name || `document_${Date.now()}`
     };
   }
-
   if (message.photo?.length) {
     const photo = message.photo[message.photo.length - 1];
     return {
@@ -263,21 +579,18 @@ function getTelegramFileInfo(message) {
       fileName: `photo_${Date.now()}.jpg`
     };
   }
-
   if (message.audio) {
     return {
       fileId: message.audio.file_id,
       fileName: message.audio.file_name || `audio_${Date.now()}.mp3`
     };
   }
-
   if (message.video) {
     return {
       fileId: message.video.file_id,
       fileName: message.video.file_name || `video_${Date.now()}.mp4`
     };
   }
-
   return null;
 }
 
@@ -285,12 +598,14 @@ bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
   if (shuttingDown) return;
 
   const senderId = String(ctx.from?.id || '');
-  if (!(await isUserAllowed(senderId))) {
-    console.log(`تم رفض ملف من مستخدم غير مصرح له: ${senderId || 'unknown'}`);
+  const allowedUser = await isUserAllowed(senderId);
+
+  if (!allowedUser) {
+    console.log(`تم رفض ملف من مستخدم غير مصرح له: ${senderId}`);
     try {
-      await ctx.reply('⛔ عذرًا، أنت غير مصرح لك باستخدام هذا البوت لرفع الملفات.');
-    } catch (replyError) {
-      console.error('تعذر إرسال رسالة الرفض:', replyError?.message || replyError);
+      await ctx.reply('⛔ عذرًا، أنت غير مصرح لك برفع الملفات عبر هذا البوت.');
+    } catch (err) {
+      console.error('تعذر إرسال رسالة الرفض:', err?.message);
     }
     return;
   }
@@ -307,30 +622,43 @@ bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
   const fileInfo = getTelegramFileInfo(ctx.message);
   if (!fileInfo) return;
 
-  await ctx.reply('⏳ تم استلام الملف، وسيتم رفعه بالترتيب...');
+  let processPlan;
+  try {
+    processPlan = await determineFolderAndFileName(
+      ctx.message.caption?.trim(),
+      fileInfo.fileName,
+      allowedUser.section
+    );
+  } catch (err) {
+    return ctx.reply(`⚠️ تنبيه في التصنيف:\n${err.message}`);
+  }
+
+  const { folderPath, fileName } = processPlan;
+
+  await ctx.reply(
+    `⏳ تم استلام الملف:\n` +
+    `📄 الاسم المعتمد: ${fileName}\n` +
+    `📂 المسار: ${folderPath.join(' / ')}`
+  );
 
   enqueueUpload(async () => {
     try {
-      await ctx.reply('⬆️ جاري رفع الملف إلى Google Drive...');
+      await ctx.reply('⬆️ جاري الرفع إلى Google Drive...');
 
       const fileLink = await ctx.telegram.getFileLink(fileInfo.fileId);
       const response = await axios.get(fileLink.href, {
         responseType: 'arraybuffer',
-        timeout: 120000,
+        timeout: 180000,
         maxContentLength: 2 * 1024 * 1024 * 1024,
         maxBodyLength: 2 * 1024 * 1024 * 1024
       });
 
       const fileBuffer = Buffer.from(response.data);
-      const folderPath = extractFolderPathFromCaption(
-        ctx.message.caption?.trim(),
-        fileInfo.fileName
-      );
       const folderId = await getOrCreateFolderPath(folderPath);
 
       const uploaded = await drive.files.create({
         requestBody: {
-          name: fileInfo.fileName,
+          name: fileName,
           parents: [folderId]
         },
         media: {
@@ -340,25 +668,20 @@ bot.on(['document', 'photo', 'audio', 'video'], async (ctx) => {
         fields: 'id,name,webViewLink'
       });
 
-      const fileUrl = uploaded.data.webViewLink
-        ? `\n🔗 ${uploaded.data.webViewLink}`
-        : '';
+      const fileUrl = uploaded.data.webViewLink ? `\n🔗 ${uploaded.data.webViewLink}` : '';
 
       await ctx.reply(
         `✅ تم رفع الملف بنجاح إلى Google Drive.\n` +
-        `📄 ${fileInfo.fileName}\n` +
+        `📄 الملف: ${fileName}\n` +
         `📂 المجلد: ${folderPath.join(' / ')}` +
         fileUrl
       );
     } catch (error) {
       console.error('خطأ أثناء الرفع إلى Google Drive:', error?.stack || error);
-
       try {
-        await ctx.reply(
-          '❌ فشل رفع الملف إلى Google Drive. تحقق من بيانات OAuth وصلاحية المجلد.'
-        );
+        await ctx.reply('❌ فشل رفع الملف إلى Google Drive. يرجى مراجعة الصلاحيات أو المحاولة لاحقاً.');
       } catch (replyError) {
-        console.error('تعذر إرسال رسالة الخطأ:', replyError?.message || replyError);
+        console.error('تعذر إرسال رسالة الخطأ:', replyError?.message);
       }
     }
   });
@@ -376,17 +699,7 @@ function startHealthServer() {
 
     if (requestPath === '/privacy') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`<!doctype html>
-<html lang="ar" dir="rtl">
-<head><meta charset="utf-8"><title>سياسة الخصوصية</title></head>
-<body>
-  <h1>سياسة الخصوصية</h1>
-  <p>يستخدم هذا التطبيق Telegram لاستقبال الملفات من المستخدمين المصرح لهم ورفعها إلى Google Drive الخاص بمالك التطبيق.</p>
-  <p>لا يبيع التطبيق البيانات ولا يشاركها مع جهات خارجية. تحفظ الملفات في Google Drive وفق صلاحيات مالك الحساب.</p>
-  <p>لا يتم استخدام بيانات المستخدمين إلا للتحقق من الصلاحية ومعالجة الملفات المطلوبة.</p>
-  <p>للتواصل: ضع بريدك الإلكتروني في إعدادات التطبيق.</p>
-</body>
-</html>`);
+      res.end(`<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>سياسة الخصوصية</title></head><body><h1>سياسة الخصوصية</h1><p>تطبيق لرفع الملفات إلى Google Drive.</p></body></html>`);
       return;
     }
 
@@ -413,7 +726,7 @@ function startHealthServer() {
 async function startBot() {
   try {
     await bot.launch({ dropPendingUpdates: false });
-    console.log('🤖 Telegram bot is running.');
+    console.log('🤖 Telegram bot is running successfully.');
   } catch (error) {
     console.error('فشل تشغيل البوت:', error?.stack || error);
     process.exit(1);
@@ -428,14 +741,12 @@ async function shutdown(signal) {
   try {
     bot.stop(signal);
   } catch (error) {
-    console.error('خطأ أثناء إيقاف Telegram:', error?.message || error);
+    console.error('خطأ أثناء إيقاف Telegram:', error?.message);
   }
 
   try {
     await uploadQueue;
-  } catch (_) {
-    // تمت معالجة الخطأ داخل مهمة الرفع.
-  }
+  } catch (_) {}
 
   if (healthServer) {
     await new Promise((resolve) => healthServer.close(resolve));
@@ -449,39 +760,3 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 startHealthServer();
 startBot();
-
-/*
-متطلبات package.json:
-{
-  "dependencies": {
-    "axios": "^1.7.0",
-    "googleapis": "^144.0.0",
-    "telegraf": "^4.16.3"
-  }
-}
-
-متغيرات Render المطلوبة:
-BOT_TOKEN
-GOOGLE_CLIENT_ID
-GOOGLE_CLIENT_SECRET
-GOOGLE_REFRESH_TOKEN
-GOOGLE_DRIVE_FOLDER_ID
-GOOGLE_SHEET_ID
-GOOGLE_SHEET_RANGE
-
-Google Sheet يجب أن يحتوي الأعمدة التالية ابتداءً من الصف الأول:
-telegram_id | name | active
-
-ضع بيانات المستخدمين ابتداءً من الصف الثاني، مثل:
-123456789 | أحمد | yes
-987654321 | سارة | no
-
-GOOGLE_SHEET_RANGE اختياري. إذا تركته فارغًا، يقرأ الكود الأعمدة A2:C من أول تبويب تلقائيًا.
-القيمة yes أو true أو 1 أو نعم أو فعال أو مفعل تعني أن المستخدم مسموح.
-
-GOOGLE_DRIVE_FOLDER_ID هو معرّف المجلد الرئيسي في Google Drive.
-إذا أردت الرفع إلى My Drive الرئيسي، اتركه فارغًا أو استخدم root.
-
-أمر التشغيل:
-node telegram-google-drive-bot.js
-*/
