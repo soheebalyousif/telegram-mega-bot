@@ -47,8 +47,9 @@ const folderCache = new Map();
 const handledMessages = new Set();
 const MAX_HANDLED_MESSAGES = 5000;
 
-// تخزين حالات المستخدمين والجلسات
+// تخزين حالات المستخدمين
 const userSessions = new Map();
+const browseState = new Map();
 
 // Caches
 let allowedUsersCache = new Map();
@@ -674,159 +675,309 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subje
   });
 }
 
-// القائمة السفلية العامة للطلاب
-const publicMainMenu = Markup.keyboard([
+// ==========================================
+// القوائم السفلية (Reply Keyboard) للتصفح
+// ==========================================
+const MAIN_MENU_KEYBOARD = Markup.keyboard([
   ['📚 تصفح المحاضرات والملفات']
 ]).resize();
 
+const YEARS_KEYBOARD = Markup.keyboard([
+  ['السنة الثانية', 'السنة الثالثة'],
+  ['السنة الرابعة', 'السنة الخامسة'],
+  ['🏠 القائمة الرئيسية']
+]).resize();
+
 bot.start(async (ctx) => {
+  browseState.delete(String(ctx.from.id));
   await ctx.reply(
     `أهلاً بك في منصة الأرشيف الطبي.\n` +
     `تفضل باختيار المحاضرات والملفات عبر الزر أدناه.`,
-    publicMainMenu
+    MAIN_MENU_KEYBOARD
   );
 });
 
-// ==========================================
-// قسم استعراض وتحميل المحاضرات للطلاب
-// ==========================================
-bot.hears('📚 تصفح المحاضرات والملفات', async (ctx) => {
-  const yearButtons = [
-    [Markup.button.callback('السنة الثانية', 'browse_yr:2030:السنة الثانية')],
-    [Markup.button.callback('السنة الثالثة', 'browse_yr:2029:السنة الثالثة')],
-    [Markup.button.callback('السنة الرابعة', 'browse_yr:2028:السنة الرابعة')],
-    [Markup.button.callback('السنة الخامسة', 'browse_yr:2027:السنة الخامسة')]
-  ];
+// استقبال النصوص للأزرار السفلية
+bot.on('text', async (ctx, next) => {
+  const userId = String(ctx.from.id);
+  const text = ctx.message.text.trim();
 
-  await ctx.reply('تفضل باختيار السنة الدراسية:', Markup.inlineKeyboard(yearButtons));
-});
+  // معالجة حالة إعادة تسمية الملف للأعضاء أولاً
+  const renameState = userSessions.get(`wait_ren_${userId}`);
+  if (renameState) {
+    userSessions.delete(`wait_ren_${userId}`);
+    let newName = text;
+    if (!path.extname(newName)) newName += '.pdf';
 
-bot.action(/^browse_yr:(\d+):(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const batch = ctx.match[1];
-  const yearName = ctx.match[2];
-
-  const subjects = await getSubjectsData();
-  const batchSubs = subjects.filter((s) => s.batch === batch);
-
-  if (batchSubs.length === 0) {
-    return ctx.editMessageText(`لا توجد مواد مدرجة حالياً لـ ${escapeHtml(yearName)}.`, { parse_mode: 'HTML' });
-  }
-
-  const subButtons = [];
-  for (let i = 0; i < batchSubs.length; i += 2) {
-    const idx1 = subjects.indexOf(batchSubs[i]);
-    const row = [Markup.button.callback(batchSubs[i].hashtag, `browse_sub:${idx1}`)];
-    if (batchSubs[i + 1]) {
-      const idx2 = subjects.indexOf(batchSubs[i + 1]);
-      row.push(Markup.button.callback(batchSubs[i + 1].hashtag, `browse_sub:${idx2}`));
+    try {
+      await drive.files.update({
+        fileId: renameState.fileId,
+        requestBody: { name: newName }
+      });
+      return ctx.reply(`تم تعديل اسم الملف بنجاح إلى:\n📄 <b>${escapeHtml(newName)}</b>`, {
+        parse_mode: 'HTML',
+        ...MAIN_MENU_KEYBOARD
+      });
+    } catch (err) {
+      return ctx.reply('تعذر تعديل اسم الملف حالياً.', MAIN_MENU_KEYBOARD);
     }
-    subButtons.push(row);
   }
 
-  subButtons.push([Markup.button.callback('🔙 رجوع للسنوات', 'browse_back_years')]);
-
-  await ctx.editMessageText(
-    `<b>${escapeHtml(yearName)}</b>\nتفضل باختيار المادة:`,
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard(subButtons) }
-  );
-});
-
-bot.action('browse_back_years', async (ctx) => {
-  await ctx.answerCbQuery();
-  const yearButtons = [
-    [Markup.button.callback('السنة الثانية', 'browse_yr:2030:السنة الثانية')],
-    [Markup.button.callback('السنة الثالثة', 'browse_yr:2029:السنة الثالثة')],
-    [Markup.button.callback('السنة الرابعة', 'browse_yr:2028:السنة الرابعة')],
-    [Markup.button.callback('السنة الخامسة', 'browse_yr:2027:السنة الخامسة')]
-  ];
-  await ctx.editMessageText('تفضل باختيار السنة الدراسية:', Markup.inlineKeyboard(yearButtons));
-});
-
-bot.action(/^browse_sub:(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const subIdx = Number(ctx.match[1]);
-  const subjects = await getSubjectsData();
-  const sub = subjects[subIdx];
-
-  const typeButtons = [
-    [
-      Markup.button.callback('📖 نظري', `browse_type:${subIdx}:نظري`),
-      Markup.button.callback('🏥 ستاج', `browse_type:${subIdx}:ستاج`)
-    ],
-    [
-      Markup.button.callback('📝 دورات', `browse_type:${subIdx}:دورات`),
-      Markup.button.callback('✨ اكسترا', `browse_type:${subIdx}:اكسترا`)
-    ],
-    [Markup.button.callback('🔙 رجوع للمواد', `browse_yr:${sub.batch}:${sub.year}`)]
-  ];
-
-  await ctx.editMessageText(
-    `<b>مادة ${escapeHtml(sub.hashtag)}</b>\nاختر القسم المطلوب:`,
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard(typeButtons) }
-  );
-});
-
-bot.action(/^browse_type:(\d+):(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const subIdx = Number(ctx.match[1]);
-  const type = ctx.match[2];
-
-  const subjects = await getSubjectsData();
-  const sub = subjects[subIdx];
-
-  let list = [];
-  if (type === 'نظري') list = sub.theory;
-  else if (type === 'دورات') list = sub.courses;
-  else if (type === 'اكسترا') list = sub.extra;
-
-  if (type === 'ستاج' || list.length === 0) {
-    return showFilesList(ctx, sub, type, '');
+  // 1. القائمة الرئيسية
+  if (text === '📚 تصفح المحاضرات والملفات') {
+    browseState.set(userId, { step: 'YEARS' });
+    return ctx.reply('تفضل باختيار السنة الدراسية:', YEARS_KEYBOARD);
   }
 
-  const docButtons = [];
-  for (let i = 0; i < list.length; i += 2) {
-    const row = [Markup.button.callback(list[i], `browse_doc:${subIdx}:${type}:${i}`)];
-    if (list[i + 1]) {
-      row.push(Markup.button.callback(list[i + 1], `browse_doc:${subIdx}:${type}:${i + 1}`));
+  if (text === '🏠 القائمة الرئيسية') {
+    browseState.delete(userId);
+    return ctx.reply('تفضل باختيار ما يناسبك:', MAIN_MENU_KEYBOARD);
+  }
+
+  // 2. اختيار السنة الدراسية
+  const yearMap = {
+    'السنة الثانية': { batch: '2030', year: 'السنة الثانية' },
+    'السنة الثالثة': { batch: '2029', year: 'السنة الثالثة' },
+    'السنة الرابعة': { batch: '2028', year: 'السنة الرابعة' },
+    'السنة الخامسة': { batch: '2027', year: 'السنة الخامسة' }
+  };
+
+  if (yearMap[text]) {
+    const { batch, year } = yearMap[text];
+    const subjects = await getSubjectsData();
+    const batchSubs = subjects.filter((s) => s.batch === batch);
+
+    if (batchSubs.length === 0) {
+      return ctx.reply(`لا توجد مواد مدرجة حالياً لـ ${escapeHtml(year)}.`, YEARS_KEYBOARD);
     }
-    docButtons.push(row);
+
+    browseState.set(userId, { step: 'SUBJECTS', batch, year });
+
+    const subRows = [];
+    for (let i = 0; i < batchSubs.length; i += 2) {
+      const row = [batchSubs[i].hashtag];
+      if (batchSubs[i + 1]) row.push(batchSubs[i + 1].hashtag);
+      subRows.push(row);
+    }
+    subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
+
+    return ctx.reply(`<b>${escapeHtml(year)}</b>\nتفضل باختيار المادة:`, {
+      parse_mode: 'HTML',
+      ...Markup.keyboard(subRows).resize()
+    });
   }
 
-  docButtons.push([
-    Markup.button.callback('📁 عام / الكل', `browse_doc:${subIdx}:${type}:none`),
-    Markup.button.callback('🔙 رجوع', `browse_sub:${subIdx}`)
-  ]);
-
-  await ctx.editMessageText(
-    `<b>${escapeHtml(sub.hashtag)} &gt; ${escapeHtml(type)}</b>\nاختر القسم المطلوب:`,
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard(docButtons) }
-  );
-});
-
-bot.action(/^browse_doc:(\d+):(.+):(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const subIdx = Number(ctx.match[1]);
-  const type = ctx.match[2];
-  const docIdx = ctx.match[3];
-
-  const subjects = await getSubjectsData();
-  const sub = subjects[subIdx];
-
-  let chosenDoc = '';
-  if (docIdx !== 'none') {
-    let list = sub.theory;
-    if (type === 'دورات') list = sub.courses;
-    else if (type === 'اكسترا') list = sub.extra;
-    chosenDoc = list[Number(docIdx)] || '';
+  if (text === '🔙 رجوع للسنوات') {
+    browseState.set(userId, { step: 'YEARS' });
+    return ctx.reply('تفضل باختيار السنة الدراسية:', YEARS_KEYBOARD);
   }
 
-  return showFilesList(ctx, sub, type, chosenDoc);
+  // 3. اختيار المادة
+  const state = browseState.get(userId);
+
+  if (state && state.step === 'SUBJECTS') {
+    const subjects = await getSubjectsData();
+    const selectedSub = subjects.find(
+      (s) => s.batch === state.batch && (s.hashtag === text || s.folderName === text)
+    );
+
+    if (selectedSub) {
+      const subIdx = subjects.indexOf(selectedSub);
+      browseState.set(userId, {
+        step: 'TYPES',
+        batch: state.batch,
+        year: state.year,
+        subIdx,
+        sub: selectedSub
+      });
+
+      const typesKeyboard = Markup.keyboard([
+        ['📖 نظري', '🏥 ستاج'],
+        ['📝 دورات', '✨ اكسترا'],
+        ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
+      ]).resize();
+
+      return ctx.reply(
+        `<b>مادة ${escapeHtml(selectedSub.hashtag)}</b>\nاختر القسم المطلوب:`,
+        { parse_mode: 'HTML', ...typesKeyboard }
+      );
+    }
+  }
+
+  if (text === '🔙 رجوع للمواد' && state) {
+    const subjects = await getSubjectsData();
+    const batchSubs = subjects.filter((s) => s.batch === state.batch);
+
+    browseState.set(userId, { step: 'SUBJECTS', batch: state.batch, year: state.year });
+
+    const subRows = [];
+    for (let i = 0; i < batchSubs.length; i += 2) {
+      const row = [batchSubs[i].hashtag];
+      if (batchSubs[i + 1]) row.push(batchSubs[i + 1].hashtag);
+      subRows.push(row);
+    }
+    subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
+
+    return ctx.reply(`<b>${escapeHtml(state.year)}</b>\nتفضل باختيار المادة:`, {
+      parse_mode: 'HTML',
+      ...Markup.keyboard(subRows).resize()
+    });
+  }
+
+  // 4. اختيار القسم (نظري، ستاج، دورات، إكسترا)
+  if (state && state.step === 'TYPES') {
+    const typeMapping = {
+      '📖 نظري': 'نظري',
+      '🏥 ستاج': 'ستاج',
+      '📝 دورات': 'دورات',
+      '✨ اكسترا': 'اكسترا'
+    };
+
+    const chosenType = typeMapping[text];
+    if (chosenType) {
+      const sub = state.sub;
+
+      let docList = [];
+      if (chosenType === 'نظري') docList = sub.theory;
+      else if (chosenType === 'دورات') docList = sub.courses;
+      else if (chosenType === 'اكسترا') docList = sub.extra;
+
+      // ستاج أو أقسام بدون تفريعات
+      if (chosenType === 'ستاج' || docList.length === 0) {
+        browseState.set(userId, {
+          ...state,
+          step: 'FILES',
+          type: chosenType,
+          sectionName: ''
+        });
+        return fetchAndShowFilesKeyboard(ctx, sub, chosenType, '');
+      }
+
+      // عرض أسماء الدكاترة كأزرار كيبورد سفلية
+      browseState.set(userId, {
+        ...state,
+        step: 'DOCTORS',
+        type: chosenType,
+        docList
+      });
+
+      const docRows = [];
+      for (let i = 0; i < docList.length; i += 2) {
+        const row = [docList[i]];
+        if (docList[i + 1]) row.push(docList[i + 1]);
+        docRows.push(row);
+      }
+      docRows.push(['📁 عام / الكل']);
+      docRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
+
+      return ctx.reply(
+        `<b>${escapeHtml(sub.hashtag)} &gt; ${escapeHtml(chosenType)}</b>\nاختر الدكتور أو القسم:`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.keyboard(docRows).resize()
+        }
+      );
+    }
+  }
+
+  if (text === '🔙 رجوع للأقسام' && state) {
+    browseState.set(userId, {
+      step: 'TYPES',
+      batch: state.batch,
+      year: state.year,
+      subIdx: state.subIdx,
+      sub: state.sub
+    });
+
+    const typesKeyboard = Markup.keyboard([
+      ['📖 نظري', '🏥 ستاج'],
+      ['📝 دورات', '✨ اكسترا'],
+      ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
+    ]).resize();
+
+    return ctx.reply(
+      `<b>مادة ${escapeHtml(state.sub.hashtag)}</b>\nاختر القسم المطلوب:`,
+      { parse_mode: 'HTML', ...typesKeyboard }
+    );
+  }
+
+  // 5. اختيار الدكتور
+  if (state && state.step === 'DOCTORS') {
+    let chosenDoc = '';
+    if (text === '📁 عام / الكل') {
+      chosenDoc = '';
+    } else if (state.docList && state.docList.includes(text)) {
+      chosenDoc = text;
+    } else {
+      return next();
+    }
+
+    browseState.set(userId, {
+      ...state,
+      step: 'FILES',
+      sectionName: chosenDoc
+    });
+
+    return fetchAndShowFilesKeyboard(ctx, state.sub, state.type, chosenDoc);
+  }
+
+  // 6. تحميل وإرسال الملف عند الضغط عليه من الكيبورد السفلي
+  if (state && state.step === 'FILES' && state.filesList) {
+    if (text === '🔙 رجوع للقائمة السابقة') {
+      if (state.docList && state.docList.length > 0) {
+        browseState.set(userId, {
+          ...state,
+          step: 'DOCTORS'
+        });
+
+        const docRows = [];
+        for (let i = 0; i < state.docList.length; i += 2) {
+          const row = [state.docList[i]];
+          if (state.docList[i + 1]) row.push(state.docList[i + 1]);
+          docRows.push(row);
+        }
+        docRows.push(['📁 عام / الكل']);
+        docRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
+
+        return ctx.reply('تفضل باختيار القسم:', {
+          parse_mode: 'HTML',
+          ...Markup.keyboard(docRows).resize()
+        });
+      } else {
+        browseState.set(userId, {
+          step: 'TYPES',
+          batch: state.batch,
+          year: state.year,
+          subIdx: state.subIdx,
+          sub: state.sub
+        });
+
+        const typesKeyboard = Markup.keyboard([
+          ['📖 نظري', '🏥 ستاج'],
+          ['📝 دورات', '✨ اكسترا'],
+          ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
+        ]).resize();
+
+        return ctx.reply('اختر القسم المطلوب:', { parse_mode: 'HTML', ...typesKeyboard });
+      }
+    }
+
+    const matchedFile = state.filesList.find(
+      (f) => f.name === text || `📄 ${f.name}` === text
+    );
+
+    if (matchedFile) {
+      return downloadAndSendFile(ctx, matchedFile.id);
+    }
+  }
+
+  return next();
 });
 
-// جلب وعرض الملفات
-async function showFilesList(ctx, sub, type, sectionName) {
-  await ctx.editMessageText('طلبك على قدم وساق، لحظات ويتم تحضير القائمة...');
+// دالة جلب وعرض الملفات في الكيبورد السفلي
+async function fetchAndShowFilesKeyboard(ctx, sub, type, sectionName) {
+  const userId = String(ctx.from.id);
+  await ctx.reply('طلبك على قدم وساق، لحظات ويتم تحضير القائمة...');
 
   try {
     const batchesMap = await getBatchesData();
@@ -844,37 +995,44 @@ async function showFilesList(ctx, sub, type, sectionName) {
     const files = driveRes.data.files || [];
 
     if (files.length === 0) {
-      return ctx.editMessageText(
+      const curState = browseState.get(userId) || {};
+      browseState.set(userId, { ...curState, filesList: [] });
+
+      const emptyKeyboard = Markup.keyboard([
+        ['🔙 رجوع للقائمة السابقة', '🏠 القائمة الرئيسية']
+      ]).resize();
+
+      return ctx.reply(
         `<b>${escapeHtml(sub.hashtag)} &gt; ${escapeHtml(type)}</b>\n\nلا توجد ملفات متوفرة هنا حالياً.`,
-        {
-          parse_mode: 'HTML',
-          ...Markup.inlineKeyboard([[Markup.button.callback('🔙 رجوع', `browse_sub:${subjectsCache.indexOf(sub)}`)]])
-        }
+        { parse_mode: 'HTML', ...emptyKeyboard }
       );
     }
 
-    const fileButtons = files.slice(0, 30).map((f) => [
-      Markup.button.callback(`📄 ${f.name}`, `dl_file:${f.id}`)
-    ]);
+    const curState = browseState.get(userId) || {};
+    browseState.set(userId, {
+      ...curState,
+      filesList: files
+    });
 
-    fileButtons.push([Markup.button.callback('🔙 رجوع للأقسام', `browse_sub:${subjectsCache.indexOf(sub)}`)]);
+    const fileRows = files.slice(0, 30).map((f) => [`📄 ${f.name}`]);
+    fileRows.push(['🔙 رجوع للقائمة السابقة', '🏠 القائمة الرئيسية']);
 
-    await ctx.editMessageText(
+    return ctx.reply(
       `<b>${escapeHtml(sub.hashtag)} &gt; ${escapeHtml(type)} ${sectionName ? `&gt; ${escapeHtml(sectionName)}` : ''}</b>\n` +
-      `تفضل بالضغط على اسم المحاضرة لتحميلها مباشرة:`,
-      { parse_mode: 'HTML', ...Markup.inlineKeyboard(fileButtons) }
+      `تفضل بالضغط على اسم المحاضرة من الأسفل لتحميلها مباشرة:`,
+      {
+        parse_mode: 'HTML',
+        ...Markup.keyboard(fileRows).resize()
+      }
     );
   } catch (error) {
     console.error('خطأ جلب الملفات:', error?.message);
-    await ctx.editMessageText('تعذر استعراض الملفات في الوقت الحالي.');
+    await ctx.reply('تعذر استعراض الملفات حالياً.');
   }
 }
 
-// إرسال الملف مباشرة
-bot.action(/^dl_file:(.+)$/, async (ctx) => {
-  const fileId = ctx.match[1];
-  await ctx.answerCbQuery();
-
+// دالة إرسال الملف
+async function downloadAndSendFile(ctx, fileId) {
   try {
     await ctx.reply('طلبك على قدم وساق، لحظات ويكون الملف بين يديك...');
 
@@ -913,10 +1071,10 @@ bot.action(/^dl_file:(.+)$/, async (ctx) => {
     console.error('خطأ إرسال الملف:', error?.message);
     await ctx.reply('تعذر إرسال الملف حالياً، يرجى المحاولة لاحقاً.');
   }
-});
+}
 
 // ==========================================
-// استقبال الملفات من الفريق
+// استقبال الملفات من أعضاء الفريق
 // ==========================================
 bot.on(['document', 'photo'], async (ctx) => {
   if (shuttingDown) return;
@@ -1058,7 +1216,7 @@ bot.action(/^btn_cancel:(.+)$/, async (ctx) => {
 });
 
 // ==========================================
-// أزرار إدارة الملف
+// أزرار إدارة الملف للفريق (حذف، تسمية، نقل)
 // ==========================================
 bot.action(/^del:(.+)$/, async (ctx) => {
   const fileId = ctx.match[1];
@@ -1094,28 +1252,6 @@ bot.action(/^ren:(.+)$/, async (ctx) => {
   await ctx.reply('تفضل بإرسال الاسم الجديد للملف بالدردشة:');
 });
 
-bot.on('text', async (ctx, next) => {
-  const userId = String(ctx.from.id);
-  const state = userSessions.get(`wait_ren_${userId}`);
-
-  if (!state) return next();
-  userSessions.delete(`wait_ren_${userId}`);
-
-  let newName = ctx.message.text.trim();
-  if (!path.extname(newName)) newName += '.pdf';
-
-  try {
-    await drive.files.update({
-      fileId: state.fileId,
-      requestBody: { name: newName }
-    });
-    await ctx.reply(`تم تعديل اسم الملف بنجاح إلى:\n📄 <b>${escapeHtml(newName)}</b>`, { parse_mode: 'HTML' });
-  } catch (err) {
-    await ctx.reply('تعذر تعديل اسم الملف.');
-  }
-});
-
-// نقل الملف
 bot.action(/^mov_start:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const fileId = ctx.match[1];
@@ -1165,10 +1301,7 @@ bot.action(/^mov_other_subs:(.+):(\d+)$/, async (ctx) => {
 
   subButtons.push([Markup.button.callback('🔙 رجوع للمادة السابقة', `mov_start:${fileId}:${curSubIdx}`)]);
 
-  await ctx.editMessageText(
-    `اختر المادة المطلوبة:`,
-    Markup.inlineKeyboard(subButtons)
-  );
+  await ctx.editMessageText(`اختر المادة المطلوبة:`, Markup.inlineKeyboard(subButtons));
 });
 
 bot.action(/^mov_sub_picked:(.+):(\d+)$/, async (ctx) => {
