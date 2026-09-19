@@ -47,8 +47,9 @@ const folderCache = new Map();
 const handledMessages = new Set();
 const MAX_HANDLED_MESSAGES = 5000;
 
-// تخزين حالات المستخدمين والجلسات
+// تخزين حالات وجلسات المستخدمين
 const userSessions = new Map();
+const browseSessions = new Map();
 
 // Caches
 let allowedUsersCache = new Map();
@@ -69,11 +70,17 @@ function enqueueUpload(task) {
   return result;
 }
 
+// تنظيف الجلسات المؤقتة
 setInterval(() => {
   const now = Date.now();
   for (const [key, session] of userSessions.entries()) {
     if (session.expiresAt && now > session.expiresAt) {
       userSessions.delete(key);
+    }
+  }
+  for (const [key, session] of browseSessions.entries()) {
+    if (session.expiresAt && now > session.expiresAt) {
+      browseSessions.delete(key);
     }
   }
 }, 10 * 60 * 1000);
@@ -205,7 +212,6 @@ function parsePinLine(caption, knownDoctors = []) {
     }
   }
 
-  // إزالة النقط والرموز الزائدة
   const cleanTitle = titlePart.replace(/[\\/:*?"<>|]/g, '').replace(/\.+$/, '').trim();
   const cleanDoctor = doctorPart
     .replace(/^(د\.?|الدكتور|الدكتورة)\s*/i, '')
@@ -303,7 +309,7 @@ async function getBatchesData() {
     batchesCache = bMap;
     batchesCacheAt = now;
   } catch (err) {
-    console.log('لم يتم العثور على تبويب batches، سيتم الاعتماد على المجلد الرئيسي الافتراضي.');
+    console.log('لم يتم العثور على تبويب batches.');
   }
   return batchesCache;
 }
@@ -352,7 +358,6 @@ async function getSubjectsData() {
 
     batch = batch.replace(/[^\d]/g, '');
 
-    // استنتاج السنة إن لم تكن مكتوبة
     if (!year) {
       if (batch === '2027') year = 'السنة الخامسة';
       else if (batch === '2028') year = 'السنة الرابعة';
@@ -401,7 +406,6 @@ async function isUserAllowed(userId) {
     const allowedUsers = await getAllowedUsers();
     return allowedUsers.get(String(userId)) || null;
   } catch (error) {
-    console.error('تعذر قراءة المستخدمين:', error?.message);
     return null;
   }
 }
@@ -447,7 +451,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     throw new Error('لم يتم التعرف على اسم المادة في الرسالة.');
   }
 
-  // 2. التحقق من صلاحية دفعة العضو
+  // 2. التحقق من صلاحية الدفعة
   if (!isAdmin && senderBatch) {
     const matchWithBatch = matchedRows.find((r) => r.batch === senderBatch);
     if (!matchWithBatch) {
@@ -472,7 +476,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     }
   }
 
-  // 4. تحديد النوع مع الأولوية للدورات
+  // 4. أولوية الدورات على الإكسترا
   const isCourses = fullTextNorm.includes('دورات') || fullTextNorm.includes('دوره') || normTags.some((t) => t.includes('دورات'));
   const isStage = !isCourses && normTags.some((t) => t.includes('ستاج') || t.includes('اوسكي'));
   const isPractical = !isCourses && normTags.some((t) => t.includes('عملي'));
@@ -524,7 +528,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     }
   }
 
-  // 5. بناء المسار: السنة ⬅️ الفصل ⬅️ المادة ⬅️ القسم
+  // 5. المسار: السنة ⬅️ الفصل ⬅️ المادة ⬅️ النوع ⬅️ القسم
   const finalPath = [];
   if (year) finalPath.push(year);
   if (semester) finalPath.push(semester);
@@ -671,165 +675,224 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subje
   });
 }
 
-// القائمة السفلية العامة للطلاب
-const publicMainMenu = Markup.keyboard([
+// =================================================================
+// لوحة المفاتيح السفلية العامة لجميع الطلاب (Reply Keyboard مو شفافة)
+// =================================================================
+const mainKeyboard = Markup.keyboard([
   ['📚 تصفح المحاضرات والملفات']
 ]).resize();
 
+const yearsKeyboard = Markup.keyboard([
+  ['السنة الثانية (دفعة 2030)', 'السنة الثالثة (دفعة 2029)'],
+  ['السنة الرابعة (دفعة 2028)', 'السنة الخامسة (دفعة 2027)'],
+  ['🏠 القائمة الرئيسية']
+]).resize();
+
 bot.start(async (ctx) => {
+  browseSessions.delete(String(ctx.from.id));
   await ctx.reply(
     `أهلاً بك في بوت المحاضرات والملفات الطبية 🩺\n` +
-    `يمكنك تصفح وتحميل أي محاضرة بصيغة PDF مباشرة بالضغط على الزر أدناه 👇`,
-    publicMainMenu
+    `تصفح وحمل أي محاضرة PDF مباشرة من الكيبورد أدناه 👇`,
+    mainKeyboard
   );
 });
 
-// ==========================================
-// قسم استعراض وتحميل المحاضرات للطلاب
-// ==========================================
-bot.hears('📚 تصفح المحاضرات والملفات', async (ctx) => {
-  const yearButtons = [
-    [Markup.button.callback('السنة الثانية (دفعة 2030)', 'browse_yr:2030:السنة الثانية')],
-    [Markup.button.callback('السنة الثالثة (دفعة 2029)', 'browse_yr:2029:السنة الثالثة')],
-    [Markup.button.callback('السنة الرابعة (دفعة 2028)', 'browse_yr:2028:السنة الرابعة')],
-    [Markup.button.callback('السنة الخامسة (دفعة 2027)', 'browse_yr:2027:السنة الخامسة')]
-  ];
+// معالج نصوص الكيبورد السفلي للتصفح والتحميل
+bot.on('text', async (ctx, next) => {
+  const userId = String(ctx.from.id);
+  const text = ctx.message.text.trim();
 
-  await ctx.reply('📚 اختر سنتك الدراسية للتصفح:', Markup.inlineKeyboard(yearButtons));
-});
+  // 1. إعادة التسمية
+  const renState = userSessions.get(`wait_ren_${userId}`);
+  if (renState) {
+    userSessions.delete(`wait_ren_${userId}`);
+    let newName = text;
+    if (!path.extname(newName)) newName += '.pdf';
 
-bot.action(/^browse_yr:(\d+):(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const batch = ctx.match[1];
-  const yearName = ctx.match[2];
-
-  const subjects = await getSubjectsData();
-  const batchSubs = subjects.filter((s) => s.batch === batch);
-
-  if (batchSubs.length === 0) {
-    return ctx.editMessageText(`⚠️ لا توجد مواد مضافة حالياً لـ ${yearName}.`);
-  }
-
-  const subButtons = [];
-  for (let i = 0; i < batchSubs.length; i += 2) {
-    const idx1 = subjects.indexOf(batchSubs[i]);
-    const row = [Markup.button.callback(batchSubs[i].hashtag, `browse_sub:${idx1}`)];
-    if (batchSubs[i + 1]) {
-      const idx2 = subjects.indexOf(batchSubs[i + 1]);
-      row.push(Markup.button.callback(batchSubs[i + 1].hashtag, `browse_sub:${idx2}`));
+    try {
+      await drive.files.update({
+        fileId: renState.fileId,
+        requestBody: { name: newName }
+      });
+      return ctx.reply(`✅ تم تعديل اسم الملف بنجاح إلى:\n📄 ${newName}`);
+    } catch (err) {
+      return ctx.reply('❌ فشل تعديل اسم الملف.');
     }
-    subButtons.push(row);
   }
 
-  subButtons.push([Markup.button.callback('🔙 رجوع للسنوات', 'browse_back_years')]);
-
-  await ctx.editMessageText(
-    `📂 *${yearName}*\nاختر المادة المطلوبة:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(subButtons) }
-  );
-});
-
-bot.action('browse_back_years', async (ctx) => {
-  await ctx.answerCbQuery();
-  const yearButtons = [
-    [Markup.button.callback('السنة الثانية (دفعة 2030)', 'browse_yr:2030:السنة الثانية')],
-    [Markup.button.callback('السنة الثالثة (دفعة 2029)', 'browse_yr:2029:السنة الثالثة')],
-    [Markup.button.callback('السنة الرابعة (دفعة 2028)', 'browse_yr:2028:السنة الرابعة')],
-    [Markup.button.callback('السنة الخامسة (دفعة 2027)', 'browse_yr:2027:السنة الخامسة')]
-  ];
-  await ctx.editMessageText('📚 اختر سنتك الدراسية للتصفح:', Markup.inlineKeyboard(yearButtons));
-});
-
-bot.action(/^browse_sub:(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const subIdx = Number(ctx.match[1]);
-  const subjects = await getSubjectsData();
-  const sub = subjects[subIdx];
-
-  const typeButtons = [
-    [
-      Markup.button.callback('📖 نظري', `browse_type:${subIdx}:نظري`),
-      Markup.button.callback('🏥 ستاج', `browse_type:${subIdx}:ستاج`)
-    ],
-    [
-      Markup.button.callback('📝 دورات', `browse_type:${subIdx}:دورات`),
-      Markup.button.callback('✨ اكسترا', `browse_type:${subIdx}:اكسترا`)
-    ],
-    [Markup.button.callback('🔙 رجوع للمواد', `browse_yr:${sub.batch}:${sub.year}`)]
-  ];
-
-  await ctx.editMessageText(
-    `📂 مادة: *${sub.hashtag}*\nاختر القسم:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(typeButtons) }
-  );
-});
-
-bot.action(/^browse_type:(\d+):(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const subIdx = Number(ctx.match[1]);
-  const type = ctx.match[2];
-
-  const subjects = await getSubjectsData();
-  const sub = subjects[subIdx];
-
-  let list = [];
-  if (type === 'نظري') list = sub.theory;
-  else if (type === 'دورات') list = sub.courses;
-  else if (type === 'اكسترا') list = sub.extra;
-
-  if (type === 'ستاج' || list.length === 0) {
-    return showFilesList(ctx, sub, type, '');
+  // 2. زر القائمة الرئيسية
+  if (text === '🏠 القائمة الرئيسية') {
+    browseSessions.delete(userId);
+    return ctx.reply('القائمة الرئيسية:', mainKeyboard);
   }
 
-  const docButtons = [];
-  for (let i = 0; i < list.length; i += 2) {
-    const row = [Markup.button.callback(list[i], `browse_doc:${subIdx}:${type}:${i}`)];
-    if (list[i + 1]) {
-      row.push(Markup.button.callback(list[i + 1], `browse_doc:${subIdx}:${type}:${i + 1}`));
+  // 3. زر بداية التصفح
+  if (text === '📚 تصفح المحاضرات والملفات') {
+    browseSessions.set(userId, { step: 'years', expiresAt: Date.now() + 30 * 60 * 1000 });
+    return ctx.reply('📚 اختر سنتك الدراسية من الكيبورد أدناه:', yearsKeyboard);
+  }
+
+  const session = browseSessions.get(userId);
+  if (!session) return next();
+
+  session.expiresAt = Date.now() + 30 * 60 * 1000;
+  const subjects = await getSubjectsData();
+
+  // 4. اختيار السنة
+  if (session.step === 'years') {
+    let batch = '';
+    let yearName = '';
+
+    if (text.includes('2030')) { batch = '2030'; yearName = 'السنة الثانية'; }
+    else if (text.includes('2029')) { batch = '2029'; yearName = 'السنة الثالثة'; }
+    else if (text.includes('2028')) { batch = '2028'; yearName = 'السنة الرابعة'; }
+    else if (text.includes('2027')) { batch = '2027'; yearName = 'السنة الخامسة'; }
+
+    if (!batch) return next();
+
+    const batchSubs = subjects.filter((s) => s.batch === batch);
+    if (batchSubs.length === 0) {
+      return ctx.reply(`⚠️ لا توجد مواد مضافة لـ ${yearName} حالياً.`);
     }
-    docButtons.push(row);
+
+    session.step = 'subjects';
+    session.batch = batch;
+    session.yearName = yearName;
+
+    const subRows = [];
+    for (let i = 0; i < batchSubs.length; i += 2) {
+      const row = [batchSubs[i].hashtag];
+      if (batchSubs[i + 1]) row.push(batchSubs[i + 1].hashtag);
+      subRows.push(row);
+    }
+    subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
+
+    return ctx.reply(
+      `📂 *${yearName}*\nاختر المادة من الكيبورد أدناه:`,
+      { parse_mode: 'Markdown', ...Markup.keyboard(subRows).resize() }
+    );
   }
 
-  docButtons.push([
-    Markup.button.callback('📁 عام / الكل', `browse_doc:${subIdx}:${type}:none`),
-    Markup.button.callback('🔙 رجوع', `browse_sub:${subIdx}`)
-  ]);
+  // 5. زر الرجوع للسنوات
+  if (text === '🔙 رجوع للسنوات') {
+    session.step = 'years';
+    return ctx.reply('📚 اختر سنتك الدراسية:', yearsKeyboard);
+  }
 
-  await ctx.editMessageText(
-    `📂 *${sub.hashtag} > ${type}*\nاختر الدكتور أو القسم:`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(docButtons) }
-  );
-});
+  // 6. اختيار المادة
+  if (session.step === 'subjects') {
+    const sub = subjects.find((s) => s.batch === session.batch && s.hashtag === text);
+    if (!sub) return next();
 
-bot.action(/^browse_doc:(\d+):(.+):(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const subIdx = Number(ctx.match[1]);
-  const type = ctx.match[2];
-  const docIdx = ctx.match[3];
+    session.step = 'types';
+    session.sub = sub;
 
-  const subjects = await getSubjectsData();
-  const sub = subjects[subIdx];
+    const typeRows = [
+      ['📖 نظري', '🏥 ستاج'],
+      ['📝 دورات', '✨ اكسترا'],
+      ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
+    ];
 
-  let chosenDoc = '';
-  if (docIdx !== 'none') {
-    let list = sub.theory;
-    if (type === 'دورات') list = sub.courses;
+    return ctx.reply(
+      `📂 مادة: *${sub.hashtag}*\nاختر القسم من الكيبورد أدناه:`,
+      { parse_mode: 'Markdown', ...Markup.keyboard(typeRows).resize() }
+    );
+  }
+
+  // 7. زر الرجوع للمواد
+  if (text === '🔙 رجوع للمواد') {
+    session.step = 'subjects';
+    const batchSubs = subjects.filter((s) => s.batch === session.batch);
+    const subRows = [];
+    for (let i = 0; i < batchSubs.length; i += 2) {
+      const row = [batchSubs[i].hashtag];
+      if (batchSubs[i + 1]) row.push(batchSubs[i + 1].hashtag);
+      subRows.push(row);
+    }
+    subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
+
+    return ctx.reply(`📂 *${session.yearName}*\nاختر المادة:`, Markup.keyboard(subRows).resize());
+  }
+
+  // 8. اختيار القسم (نظري، ستاج، دورات، إكسترا)
+  if (session.step === 'types') {
+    let type = '';
+    if (text === '📖 نظري') type = 'نظري';
+    else if (text === '🏥 ستاج') type = 'ستاج';
+    else if (text === '📝 دورات') type = 'دورات';
+    else if (text === '✨ اكسترا') type = 'اكسترا';
+
+    if (!type) return next();
+
+    session.type = type;
+    const sub = session.sub;
+
+    let list = [];
+    if (type === 'نظري') list = sub.theory;
+    else if (type === 'دورات') list = sub.courses;
     else if (type === 'اكسترا') list = sub.extra;
-    chosenDoc = list[Number(docIdx)] || '';
+
+    // ستاج أو أقسام بدون دكاترة تفتح الملفات مباشرة
+    if (type === 'ستاج' || list.length === 0) {
+      session.doctor = '';
+      return loadAndShowFilesKeyboard(ctx, session);
+    }
+
+    session.step = 'doctors';
+    const docRows = [];
+    for (let i = 0; i < list.length; i += 2) {
+      const row = [list[i]];
+      if (list[i + 1]) row.push(list[i + 1]);
+      docRows.push(row);
+    }
+    docRows.push(['📁 عام / الكل']);
+    docRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
+
+    return ctx.reply(
+      `📂 *${sub.hashtag} > ${type}*\nاختر الدكتور أو القسم من الكيبورد أدناه:`,
+      { parse_mode: 'Markdown', ...Markup.keyboard(docRows).resize() }
+    );
   }
 
-  return showFilesList(ctx, sub, type, chosenDoc);
+  // 9. زر الرجوع للأقسام
+  if (text === '🔙 رجوع للأقسام') {
+    session.step = 'types';
+    const typeRows = [
+      ['📖 نظري', '🏥 ستاج'],
+      ['📝 دورات', '✨ اكسترا'],
+      ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
+    ];
+    return ctx.reply(`📂 مادة: *${session.sub.hashtag}*\nاختر القسم:`, Markup.keyboard(typeRows).resize());
+  }
+
+  // 10. اختيار الدكتور
+  if (session.step === 'doctors') {
+    let chosenDoc = text === '📁 عام / الكل' ? '' : text;
+    session.doctor = chosenDoc;
+    return loadAndShowFilesKeyboard(ctx, session);
+  }
+
+  // 11. تحميل الملف المختار من الكيبورد مباشرة كـ PDF
+  if (session.step === 'files') {
+    if (session.filesMap && session.filesMap.has(text)) {
+      const fileData = session.filesMap.get(text);
+      return sendPdfToStudent(ctx, fileData);
+    }
+  }
+
+  return next();
 });
 
-// جلب وعرض الملفات كأزرار تحميل
-async function showFilesList(ctx, sub, type, sectionName) {
-  await ctx.editMessageText('⏳ جاري جلب قائمة المحاضرات من Google Drive...');
+// دالة جلب وعرض الملفات كأزرار كيبورد سفلية
+async function loadAndShowFilesKeyboard(ctx, session) {
+  const { sub, type, doctor } = session;
+  await ctx.reply('⏳ جاري جلب قائمة المحاضرات من Google Drive...');
 
   try {
     const batchesMap = await getBatchesData();
     const rootParentId = batchesMap.get(sub.batch) || GOOGLE_DRIVE_FOLDER_ID;
 
-    const pathArr = [sub.year, sub.semester, sub.folderName, type, sectionName].filter(Boolean);
+    const pathArr = [sub.year, sub.semester, sub.folderName, type, doctor].filter(Boolean);
     const targetFolderId = await getOrCreateFolderPath(pathArr, rootParentId);
 
     const driveRes = await drive.files.list({
@@ -841,69 +904,67 @@ async function showFilesList(ctx, sub, type, sectionName) {
     const files = driveRes.data.files || [];
 
     if (files.length === 0) {
-      return ctx.editMessageText(
-        `📂 *${sub.hashtag} > ${type}*\n\n⚠️ لا توجد ملفات مرفوعة هنا حالياً.`,
+      return ctx.reply(
+        `📂 *${sub.hashtag} > ${type} ${doctor ? `> ${doctor}` : ''}*\n\n⚠️ لا توجد ملفات مرفوعة هنا حالياً.`,
         {
           parse_mode: 'Markdown',
-          ...Markup.inlineKeyboard([[Markup.button.callback('🔙 رجوع', `browse_sub:${subjectsCache.indexOf(sub)}`)]])
+          ...Markup.keyboard([['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']]).resize()
         }
       );
     }
 
-    const fileButtons = files.slice(0, 30).map((f) => [
-      Markup.button.callback(`📄 ${f.name}`, `dl_file:${f.id}`)
-    ]);
+    session.step = 'files';
+    const filesMap = new Map();
+    const fileRows = [];
 
-    fileButtons.push([Markup.button.callback('🔙 رجوع للأقسام', `browse_sub:${subjectsCache.indexOf(sub)}`)]);
+    files.slice(0, 25).forEach((f) => {
+      const btnText = `📄 ${f.name.replace(/\.pdf$/i, '')}`;
+      filesMap.set(btnText, f);
+      fileRows.push([btnText]);
+    });
 
-    await ctx.editMessageText(
-      `📂 *${sub.hashtag} > ${type} ${sectionName ? `> ${sectionName}` : ''}*\n` +
-      `اضغط على اسم أي محاضرة لتحميلها مباشرة 👇:`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard(fileButtons) }
+    session.filesMap = filesMap;
+    fileRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
+
+    await ctx.reply(
+      `📂 *${sub.hashtag} > ${type} ${doctor ? `> ${doctor}` : ''}*\n` +
+      `اضغط على اسم أي محاضرة بالكيبورد أدناه لتحميلها كـ PDF فوراً 👇:`,
+      { parse_mode: 'Markdown', ...Markup.keyboard(fileRows).resize() }
     );
   } catch (error) {
     console.error('خطأ جلب الملفات:', error?.message);
-    await ctx.editMessageText('❌ تعذر جلب الملفات من Google Drive.');
+    await ctx.reply('❌ تعذر جلب الملفات من Google Drive.');
   }
 }
 
-// إرسال ملف الـ PDF مباشرة للدردشة
-bot.action(/^dl_file:(.+)$/, async (ctx) => {
-  const fileId = ctx.match[1];
-  await ctx.answerCbQuery('جاري تجهيز الملف وإرساله...');
-
+// دالة إرسال الـ PDF المباشر للطالب
+async function sendPdfToStudent(ctx, fileMeta) {
   try {
-    await ctx.reply('⏳ جاري إرسال المحاضرة إليك بصيغة PDF مباشرة...');
+    await ctx.reply(`⏳ جاري إرسال: ${fileMeta.name} بصيغة PDF...`);
 
-    const fileMeta = await drive.files.get({
-      fileId,
-      fields: 'id, name, size, webViewLink'
-    });
+    const fileSize = Number(fileMeta.size || 0);
 
-    const fileSize = Number(fileMeta.data.size || 0);
-
-    // إذا كان حجم الملف أكبر من 50 ميغابايت (حد تيليغرام للبوتات)
     if (fileSize > 48 * 1024 * 1024) {
       return ctx.reply(
-        `📄 *${fileMeta.data.name}*\n\n` +
+        `📄 *${fileMeta.name}*\n\n` +
         `⚠️ حجم الملف كبير (${(fileSize / (1024 * 1024)).toFixed(1)} ميغابايت).\n` +
-        `يمكنك تحميله مباشرة من الرابط التالي:\n🔗 ${fileMeta.data.webViewLink}`,
+        `يمكنك تحميله من الرابط التالي:\n🔗 ${fileMeta.webViewLink}`,
         { parse_mode: 'Markdown' }
       );
     }
 
     const driveStream = await drive.files.get(
-      { fileId, alt: 'media' },
+      { fileId: fileMeta.id, alt: 'media' },
       { responseType: 'stream' }
     );
 
     await ctx.replyWithDocument(
       {
         source: driveStream.data,
-        filename: fileMeta.data.name
+        filename: fileMeta.name
       },
       {
-        caption: `📄 *${fileMeta.data.name}*\n\n🔗 [رابط الملف على Google Drive](${fileMeta.data.webViewLink})`,
+        caption: `📄 *${fileMeta.name}*\n\n🔗 [رابط الملف على Google Drive](${fileMeta.webViewLink})`,
         parse_mode: 'Markdown'
       }
     );
@@ -911,7 +972,7 @@ bot.action(/^dl_file:(.+)$/, async (ctx) => {
     console.error('خطأ إرسال الملف:', error?.message);
     await ctx.reply('❌ تعذر إرسال الملف، يرجى المحاولة لاحقاً.');
   }
-});
+}
 
 // ==========================================
 // استقبال الملفات من أعضاء الفريق المصرح لهم
@@ -1056,7 +1117,7 @@ bot.action(/^btn_cancel:(.+)$/, async (ctx) => {
 });
 
 // ==========================================
-// أزرار إدارة الملف (حذف، تسمية، نقل)
+// أزرار إدارة الملف للفريق (حذف، تسمية، نقل)
 // ==========================================
 bot.action(/^del:(.+)$/, async (ctx) => {
   const fileId = ctx.match[1];
@@ -1092,28 +1153,7 @@ bot.action(/^ren:(.+)$/, async (ctx) => {
   await ctx.reply('✏️ أرسل الآن الاسم الجديد للملف بالدردشة:');
 });
 
-bot.on('text', async (ctx, next) => {
-  const userId = String(ctx.from.id);
-  const state = userSessions.get(`wait_ren_${userId}`);
-
-  if (!state) return next();
-  userSessions.delete(`wait_ren_${userId}`);
-
-  let newName = ctx.message.text.trim();
-  if (!path.extname(newName)) newName += '.pdf';
-
-  try {
-    await drive.files.update({
-      fileId: state.fileId,
-      requestBody: { name: newName }
-    });
-    await ctx.reply(`✅ تم تعديل اسم الملف بنجاح إلى:\n📄 ${newName}`);
-  } catch (err) {
-    await ctx.reply('❌ فشل تعديل اسم الملف.');
-  }
-});
-
-// نقل ذكي يبدأ من نفس المادة ونفس الدفعة مع زر رجوع
+// نقل يبدأ من نفس المادة ونفس الدفعة مع أزرار رجوع
 bot.action(/^mov_start:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const fileId = ctx.match[1];
