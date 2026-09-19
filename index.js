@@ -225,6 +225,22 @@ function parsePinLine(caption, knownDoctors = []) {
   };
 }
 
+// دالة لمعرفة هل المادة سريرية (ستاج) أم مخبرية (عملي) أم نظرية
+function getSubjectTrainingType(sub) {
+  const norm = normalizeArabic(sub.hashtag);
+
+  // مواد مخبرية (عملي)
+  const isLab = ['النسج', 'الكيمياء الحيويه', 'الكيمياء السريريه', 'الاحياء الدقيقه', 'علم الامراض', 'الفيزيولوجيا', 'التشريح'].some((k) => norm.includes(k));
+  if (isLab) return 'عملي';
+
+  // مواد سريرية (ستاج)
+  const isClinical = ['الباطنه', 'الجراحه', 'الاطفال', 'النسائيه', 'العين', 'اذن', 'الاذنيه', 'الاورام', 'المهارات السريريه', 'الاسره'].some((k) => norm.includes(k));
+  if (isClinical) return 'ستاج';
+
+  // مواد نظرية بحتة
+  return 'none';
+}
+
 async function resolveSheetTitles() {
   if (resolvedUsersSheetTitle && resolvedSubjectsSheetTitle && resolvedBatchesSheetTitle) return;
 
@@ -421,7 +437,6 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
   const fullTextNorm = normalizeArabic(caption);
   const subjects = await getSubjectsData();
 
-  // 1. تحديد المادة
   let matchedRows = [];
   let subjectTag = '';
 
@@ -451,7 +466,6 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     throw new Error('لم يتم التعرف على اسم المادة في الرسالة.');
   }
 
-  // 2. التحقق من صلاحية الدفعة
   if (!isAdmin && senderBatch) {
     const matchWithBatch = matchedRows.find((r) => r.batch === senderBatch);
     if (!matchWithBatch) {
@@ -462,8 +476,8 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
 
   const selectedSubject = matchedRows[0];
   const { folderName, year, semester, batch } = selectedSubject;
+  const trainingType = getSubjectTrainingType(selectedSubject);
 
-  // 3. تحليل سطر الدبوس 📌
   const pinInfo = parsePinLine(caption, selectedSubject.theory);
   let finalFileName = originalFileName;
   const ext = path.extname(originalFileName) || '.pdf';
@@ -476,7 +490,6 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     }
   }
 
-  // 4. أولوية الدورات على الإكسترا
   const isCourses = fullTextNorm.includes('دورات') || fullTextNorm.includes('دوره') || normTags.some((t) => t.includes('دورات'));
   const isStage = !isCourses && normTags.some((t) => t.includes('ستاج') || t.includes('اوسكي'));
   const isPractical = !isCourses && normTags.some((t) => t.includes('عملي'));
@@ -528,7 +541,6 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     }
   }
 
-  // 5. المسار: السنة ⬅️ الفصل ⬅️ المادة ⬅️ النوع ⬅️ القسم
   const finalPath = [];
   if (year) finalPath.push(year);
   if (semester) finalPath.push(semester);
@@ -541,6 +553,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     fileName: finalFileName,
     selectedSubject,
     batch,
+    trainingType,
     isFullyDetermined: Boolean(isStage || isPractical || isCourses || isExtra || pinInfo || chosenSection)
   };
 }
@@ -676,7 +689,7 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subje
 }
 
 // =================================================================
-// لوحة المفاتيح السفلية العامة لجميع الطلاب (Reply Keyboard مو شفافة)
+// لوحة المفاتيح السفلية لجميع الطلاب (Reply Keyboard مو شفافة)
 // =================================================================
 const mainKeyboard = Markup.keyboard([
   ['📚 تصفح المحاضرات والملفات']
@@ -697,7 +710,6 @@ bot.start(async (ctx) => {
   );
 });
 
-// معالج نصوص الكيبورد السفلي للتصفح والتحميل
 bot.on('text', async (ctx, next) => {
   const userId = String(ctx.from.id);
   const text = ctx.message.text.trim();
@@ -786,9 +798,15 @@ bot.on('text', async (ctx, next) => {
 
     session.step = 'types';
     session.sub = sub;
+    const trainingType = getSubjectTrainingType(sub);
+
+    // فصل العملي والستاج بدقة في خيارات الأزرار
+    const firstRow = ['📖 نظري'];
+    if (trainingType === 'عملي') firstRow.push('🔬 عملي');
+    else if (trainingType === 'ستاج') firstRow.push('🏥 ستاج');
 
     const typeRows = [
-      ['📖 نظري', '🏥 ستاج'],
+      firstRow,
       ['📝 دورات', '✨ اكسترا'],
       ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
     ];
@@ -814,10 +832,11 @@ bot.on('text', async (ctx, next) => {
     return ctx.reply(`📂 *${session.yearName}*\nاختر المادة:`, Markup.keyboard(subRows).resize());
   }
 
-  // 8. اختيار القسم (نظري، ستاج، دورات، إكسترا)
+  // 8. اختيار القسم (نظري، عملي، ستاج، دورات، إكسترا)
   if (session.step === 'types') {
     let type = '';
     if (text === '📖 نظري') type = 'نظري';
+    else if (text === '🔬 عملي') type = 'عملي';
     else if (text === '🏥 ستاج') type = 'ستاج';
     else if (text === '📝 دورات') type = 'دورات';
     else if (text === '✨ اكسترا') type = 'اكسترا';
@@ -832,8 +851,8 @@ bot.on('text', async (ctx, next) => {
     else if (type === 'دورات') list = sub.courses;
     else if (type === 'اكسترا') list = sub.extra;
 
-    // ستاج أو أقسام بدون دكاترة تفتح الملفات مباشرة
-    if (type === 'ستاج' || list.length === 0) {
+    // عملي أو ستاج أو أقسام بدون دكاترة تفتح الملفات مباشرة
+    if (type === 'عملي' || type === 'ستاج' || list.length === 0) {
       session.doctor = '';
       return loadAndShowFilesKeyboard(ctx, session);
     }
@@ -845,7 +864,8 @@ bot.on('text', async (ctx, next) => {
       if (list[i + 1]) row.push(list[i + 1]);
       docRows.push(row);
     }
-    docRows.push(['📁 عام / الكل']);
+    // الزر المعتمد رسمياً: عرض كل الملفات
+    docRows.push(['📁 عرض كل الملفات']);
     docRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
 
     return ctx.reply(
@@ -857,17 +877,22 @@ bot.on('text', async (ctx, next) => {
   // 9. زر الرجوع للأقسام
   if (text === '🔙 رجوع للأقسام') {
     session.step = 'types';
+    const trainingType = getSubjectTrainingType(session.sub);
+    const firstRow = ['📖 نظري'];
+    if (trainingType === 'عملي') firstRow.push('🔬 عملي');
+    else if (trainingType === 'ستاج') firstRow.push('🏥 ستاج');
+
     const typeRows = [
-      ['📖 نظري', '🏥 ستاج'],
+      firstRow,
       ['📝 دورات', '✨ اكسترا'],
       ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
     ];
     return ctx.reply(`📂 مادة: *${session.sub.hashtag}*\nاختر القسم:`, Markup.keyboard(typeRows).resize());
   }
 
-  // 10. اختيار الدكتور
+  // 10. اختيار الدكتور أو عرض كل الملفات
   if (session.step === 'doctors') {
-    let chosenDoc = text === '📁 عام / الكل' ? '' : text;
+    let chosenDoc = text === '📁 عرض كل الملفات' ? '' : text;
     session.doctor = chosenDoc;
     return loadAndShowFilesKeyboard(ctx, session);
   }
@@ -883,7 +908,7 @@ bot.on('text', async (ctx, next) => {
   return next();
 });
 
-// دالة جلب وعرض الملفات كأزرار كيبورد سفلية
+// جلب وعرض الملفات كأزرار كيبورد سفلية
 async function loadAndShowFilesKeyboard(ctx, session) {
   const { sub, type, doctor } = session;
   await ctx.reply('⏳ جاري جلب قائمة المحاضرات من Google Drive...');
@@ -937,7 +962,7 @@ async function loadAndShowFilesKeyboard(ctx, session) {
   }
 }
 
-// دالة إرسال الـ PDF المباشر للطالب
+// إرسال ملف الـ PDF المباشر للطالب
 async function sendPdfToStudent(ctx, fileMeta) {
   try {
     await ctx.reply(`⏳ جاري إرسال: ${fileMeta.name} بصيغة PDF...`);
@@ -1006,7 +1031,7 @@ bot.on(['document', 'photo'], async (ctx) => {
     return ctx.reply(`⚠️ تنبيه:\n${err.message}`);
   }
 
-  const { folderPath, fileName, selectedSubject, batch, isFullyDetermined } = processPlan;
+  const { folderPath, fileName, selectedSubject, batch, trainingType, isFullyDetermined } = processPlan;
   const subIdx = subjectsCache.indexOf(selectedSubject);
 
   if (!isFullyDetermined) {
@@ -1020,11 +1045,12 @@ bot.on(['document', 'photo'], async (ctx) => {
       expiresAt: Date.now() + 15 * 60 * 1000
     });
 
+    const firstRow = [Markup.button.callback('📖 نظري', `btn_type:${sessionId}:نظري`)];
+    if (trainingType === 'عملي') firstRow.push(Markup.button.callback('🔬 عملي', `btn_type:${sessionId}:عملي`));
+    else if (trainingType === 'ستاج') firstRow.push(Markup.button.callback('🏥 ستاج', `btn_type:${sessionId}:ستاج`));
+
     const buttons = [
-      [
-        Markup.button.callback('📖 نظري', `btn_type:${sessionId}:نظري`),
-        Markup.button.callback('🏥 ستاج', `btn_type:${sessionId}:ستاج`)
-      ],
+      firstRow,
       [
         Markup.button.callback('📝 دورات', `btn_type:${sessionId}:دورات`),
         Markup.button.callback('✨ اكسترا', `btn_type:${sessionId}:اكسترا`)
@@ -1051,10 +1077,10 @@ bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
 
   const { selectedSubject, batch, fileInfo, fileName, subIdx } = session;
 
-  if (type === 'ستاج') {
+  if (type === 'ستاج' || type === 'عملي') {
     userSessions.delete(sessionId);
-    await ctx.editMessageText('✅ تم اختيار ستاج، جاري الرفع...');
-    const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, 'ستاج'].filter(Boolean);
+    await ctx.editMessageText(`✅ تم اختيار ${type}، جاري الرفع...`);
+    const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type].filter(Boolean);
     return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, subjectIdx: subIdx });
   }
 
@@ -1153,7 +1179,7 @@ bot.action(/^ren:(.+)$/, async (ctx) => {
   await ctx.reply('✏️ أرسل الآن الاسم الجديد للملف بالدردشة:');
 });
 
-// نقل يبدأ من نفس المادة ونفس الدفعة مع أزرار رجوع
+// نقل ذكي محصور بدفعة المادة وبداية مباشرة من نفس المادة
 bot.action(/^mov_start:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const fileId = ctx.match[1];
@@ -1161,12 +1187,14 @@ bot.action(/^mov_start:(.+):(\d+)$/, async (ctx) => {
 
   const subjects = await getSubjectsData();
   const sub = subjects[subIdx];
+  const trainingType = getSubjectTrainingType(sub);
+
+  const firstRow = [Markup.button.callback('📖 نظري', `mov_t:${fileId}:${subIdx}:نظري`)];
+  if (trainingType === 'عملي') firstRow.push(Markup.button.callback('🔬 عملي', `mov_t:${fileId}:${subIdx}:عملي`));
+  else if (trainingType === 'ستاج') firstRow.push(Markup.button.callback('🏥 ستاج', `mov_t:${fileId}:${subIdx}:ستاج`));
 
   const typeButtons = [
-    [
-      Markup.button.callback('📖 نظري', `mov_t:${fileId}:${subIdx}:نظري`),
-      Markup.button.callback('🏥 ستاج', `mov_t:${fileId}:${subIdx}:ستاج`)
-    ],
+    firstRow,
     [
       Markup.button.callback('📝 دورات', `mov_t:${fileId}:${subIdx}:دورات`),
       Markup.button.callback('✨ اكسترا', `mov_t:${fileId}:${subIdx}:اكسترا`)
@@ -1214,12 +1242,14 @@ bot.action(/^mov_sub_picked:(.+):(\d+)$/, async (ctx) => {
   const fileId = ctx.match[1];
   const subIdx = Number(ctx.match[2]);
   const sub = (await getSubjectsData())[subIdx];
+  const trainingType = getSubjectTrainingType(sub);
+
+  const firstRow = [Markup.button.callback('📖 نظري', `mov_t:${fileId}:${subIdx}:نظري`)];
+  if (trainingType === 'عملي') firstRow.push(Markup.button.callback('🔬 عملي', `mov_t:${fileId}:${subIdx}:عملي`));
+  else if (trainingType === 'ستاج') firstRow.push(Markup.button.callback('🏥 ستاج', `mov_t:${fileId}:${subIdx}:ستاج`));
 
   const typeButtons = [
-    [
-      Markup.button.callback('📖 نظري', `mov_t:${fileId}:${subIdx}:نظري`),
-      Markup.button.callback('🏥 ستاج', `mov_t:${fileId}:${subIdx}:ستاج`)
-    ],
+    firstRow,
     [
       Markup.button.callback('📝 دورات', `mov_t:${fileId}:${subIdx}:دورات`),
       Markup.button.callback('✨ اكسترا', `mov_t:${fileId}:${subIdx}:اكسترا`)
@@ -1242,8 +1272,8 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
   const subjects = await getSubjectsData();
   const sub = subjects[subIdx];
 
-  if (type === 'ستاج') {
-    const finalPath = [sub.year, sub.semester, sub.folderName, 'ستاج'].filter(Boolean);
+  if (type === 'ستاج' || type === 'عملي') {
+    const finalPath = [sub.year, sub.semester, sub.folderName, type].filter(Boolean);
     return doMove(ctx, fileId, finalPath, sub.batch);
   }
 
