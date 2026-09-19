@@ -344,6 +344,8 @@ async function getSubjectsData() {
   const batchIdx = headers.indexOf('batch');
   const yearIdx = headers.indexOf('year');
   const semesterIdx = headers.indexOf('semester');
+  const practicalIdx = headers.indexOf('practical');
+  const stageIdx = headers.indexOf('stage');
 
   const parsed = [];
 
@@ -369,6 +371,10 @@ async function getSubjectsData() {
     if (/ثان|2/i.test(semester)) semester = 'الفصل الثاني';
     else if (/اول|أول|1/i.test(semester)) semester = 'الفصل الأول';
 
+    // فحص هل المادة تحتوي على عملي أو ستاج
+    const hasPractical = practicalIdx !== -1 && Boolean(String(row[practicalIdx] || '').trim());
+    const hasStage = stageIdx !== -1 && Boolean(String(row[stageIdx] || '').trim());
+
     const theorySections = [];
     const extraSections = [];
     const coursesSections = [];
@@ -391,6 +397,8 @@ async function getSubjectsData() {
       batch,
       year,
       semester,
+      hasPractical,
+      hasStage,
       theory: [...new Set(theorySections)],
       extra: [...new Set(extraSections)],
       courses: [...new Set(coursesSections)]
@@ -675,6 +683,25 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subje
   });
 }
 
+// دالة توليد أزرار الأقسام بذكاء حسب نوع المادة
+function generateTypeKeyboard(sub, backText) {
+  const rows = [];
+  const topRow = ['📖 نظري'];
+
+  // إظهار عملي أو ستاج حسب طبيعة المادة بالشيت
+  if (sub.hasPractical) {
+    topRow.push('🔬 عملي');
+  } else if (sub.hasStage) {
+    topRow.push('🏥 ستاج');
+  }
+
+  rows.push(topRow);
+  rows.push(['📝 دورات', '✨ اكسترا']);
+  rows.push([backText, '🏠 القائمة الرئيسية']);
+
+  return Markup.keyboard(rows).resize();
+}
+
 // ==========================================
 // القوائم السفلية (Reply Keyboard) للتصفح
 // ==========================================
@@ -697,12 +724,11 @@ bot.start(async (ctx) => {
   );
 });
 
-// استقبال النصوص للأزرار السفلية
 bot.on('text', async (ctx, next) => {
   const userId = String(ctx.from.id);
   const text = ctx.message.text.trim();
 
-  // معالجة حالة إعادة تسمية الملف للأعضاء أولاً
+  // إعادة التسمية للأعضاء
   const renameState = userSessions.get(`wait_ren_${userId}`);
   if (renameState) {
     userSessions.delete(`wait_ren_${userId}`);
@@ -791,11 +817,7 @@ bot.on('text', async (ctx, next) => {
         sub: selectedSub
       });
 
-      const typesKeyboard = Markup.keyboard([
-        ['📖 نظري', '🏥 ستاج'],
-        ['📝 دورات', '✨ اكسترا'],
-        ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
-      ]).resize();
+      const typesKeyboard = generateTypeKeyboard(selectedSub, '🔙 رجوع للمواد');
 
       return ctx.reply(
         `<b>مادة ${escapeHtml(selectedSub.hashtag)}</b>\nاختر القسم المطلوب:`,
@@ -824,10 +846,11 @@ bot.on('text', async (ctx, next) => {
     });
   }
 
-  // 4. اختيار القسم (نظري، ستاج، دورات، إكسترا)
+  // 4. اختيار القسم
   if (state && state.step === 'TYPES') {
     const typeMapping = {
       '📖 نظري': 'نظري',
+      '🔬 عملي': 'عملي',
       '🏥 ستاج': 'ستاج',
       '📝 دورات': 'دورات',
       '✨ اكسترا': 'اكسترا'
@@ -842,8 +865,7 @@ bot.on('text', async (ctx, next) => {
       else if (chosenType === 'دورات') docList = sub.courses;
       else if (chosenType === 'اكسترا') docList = sub.extra;
 
-      // ستاج أو أقسام بدون تفريعات
-      if (chosenType === 'ستاج' || docList.length === 0) {
+      if (chosenType === 'ستاج' || chosenType === 'عملي' || docList.length === 0) {
         browseState.set(userId, {
           ...state,
           step: 'FILES',
@@ -853,7 +875,6 @@ bot.on('text', async (ctx, next) => {
         return fetchAndShowFilesKeyboard(ctx, sub, chosenType, '');
       }
 
-      // عرض أسماء الدكاترة كأزرار كيبورد سفلية
       browseState.set(userId, {
         ...state,
         step: 'DOCTORS',
@@ -867,7 +888,7 @@ bot.on('text', async (ctx, next) => {
         if (docList[i + 1]) row.push(docList[i + 1]);
         docRows.push(row);
       }
-      docRows.push(['📁 عام / الكل']);
+      docRows.push(['📁 كل المحاضرات']);
       docRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
 
       return ctx.reply(
@@ -889,11 +910,7 @@ bot.on('text', async (ctx, next) => {
       sub: state.sub
     });
 
-    const typesKeyboard = Markup.keyboard([
-      ['📖 نظري', '🏥 ستاج'],
-      ['📝 دورات', '✨ اكسترا'],
-      ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
-    ]).resize();
+    const typesKeyboard = generateTypeKeyboard(state.sub, '🔙 رجوع للمواد');
 
     return ctx.reply(
       `<b>مادة ${escapeHtml(state.sub.hashtag)}</b>\nاختر القسم المطلوب:`,
@@ -901,10 +918,10 @@ bot.on('text', async (ctx, next) => {
     );
   }
 
-  // 5. اختيار الدكتور
+  // 5. اختيار الدكتور أو (كل المحاضرات)
   if (state && state.step === 'DOCTORS') {
     let chosenDoc = '';
-    if (text === '📁 عام / الكل') {
+    if (text === '📁 كل المحاضرات') {
       chosenDoc = '';
     } else if (state.docList && state.docList.includes(text)) {
       chosenDoc = text;
@@ -921,7 +938,7 @@ bot.on('text', async (ctx, next) => {
     return fetchAndShowFilesKeyboard(ctx, state.sub, state.type, chosenDoc);
   }
 
-  // 6. تحميل وإرسال الملف عند الضغط عليه من الكيبورد السفلي
+  // 6. تحميل وإرسال الملف
   if (state && state.step === 'FILES' && state.filesList) {
     if (text === '🔙 رجوع للقائمة السابقة') {
       if (state.docList && state.docList.length > 0) {
@@ -936,7 +953,7 @@ bot.on('text', async (ctx, next) => {
           if (state.docList[i + 1]) row.push(state.docList[i + 1]);
           docRows.push(row);
         }
-        docRows.push(['📁 عام / الكل']);
+        docRows.push(['📁 كل المحاضرات']);
         docRows.push(['🔙 رجوع للأقسام', '🏠 القائمة الرئيسية']);
 
         return ctx.reply('تفضل باختيار القسم:', {
@@ -952,12 +969,7 @@ bot.on('text', async (ctx, next) => {
           sub: state.sub
         });
 
-        const typesKeyboard = Markup.keyboard([
-          ['📖 نظري', '🏥 ستاج'],
-          ['📝 دورات', '✨ اكسترا'],
-          ['🔙 رجوع للمواد', '🏠 القائمة الرئيسية']
-        ]).resize();
-
+        const typesKeyboard = generateTypeKeyboard(state.sub, '🔙 رجوع للمواد');
         return ctx.reply('اختر القسم المطلوب:', { parse_mode: 'HTML', ...typesKeyboard });
       }
     }
@@ -974,7 +986,6 @@ bot.on('text', async (ctx, next) => {
   return next();
 });
 
-// دالة جلب وعرض الملفات في الكيبورد السفلي
 async function fetchAndShowFilesKeyboard(ctx, sub, type, sectionName) {
   const userId = String(ctx.from.id);
   await ctx.reply('طلبك على قدم وساق، لحظات ويتم تحضير القائمة...');
@@ -1031,7 +1042,6 @@ async function fetchAndShowFilesKeyboard(ctx, sub, type, sectionName) {
   }
 }
 
-// دالة إرسال الملف
 async function downloadAndSendFile(ctx, fileId) {
   try {
     await ctx.reply('طلبك على قدم وساق، لحظات ويكون الملف بين يديك...');
@@ -1178,7 +1188,7 @@ bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
   }
 
   docButtons.push([
-    Markup.button.callback('📁 عام / بدون قسم', `btn_doc:${sessionId}:none`),
+    Markup.button.callback('📁 كل المحاضرات', `btn_doc:${sessionId}:none`),
     Markup.button.callback('❌ إلغاء', `btn_cancel:${sessionId}`)
   ]);
 
@@ -1216,7 +1226,7 @@ bot.action(/^btn_cancel:(.+)$/, async (ctx) => {
 });
 
 // ==========================================
-// أزرار إدارة الملف للفريق (حذف، تسمية، نقل)
+// أزرار إدارة الملف للفريق
 // ==========================================
 bot.action(/^del:(.+)$/, async (ctx) => {
   const fileId = ctx.match[1];
@@ -1337,8 +1347,8 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
   const subjects = await getSubjectsData();
   const sub = subjects[subIdx];
 
-  if (type === 'ستاج') {
-    const finalPath = [sub.year, sub.semester, sub.folderName, 'ستاج'].filter(Boolean);
+  if (type === 'ستاج' || type === 'عملي') {
+    const finalPath = [sub.year, sub.semester, sub.folderName, type].filter(Boolean);
     return doMove(ctx, fileId, finalPath, sub.batch);
   }
 
@@ -1360,7 +1370,7 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
   }
 
   docButtons.push([
-    Markup.button.callback('📁 بدون تفريع دكتور', `mov_f:${fileId}:${subIdx}:${type}:none`),
+    Markup.button.callback('📁 كل المحاضرات', `mov_f:${fileId}:${subIdx}:${type}:none`),
     Markup.button.callback('🔙 رجوع', `mov_sub_picked:${fileId}:${subIdx}`)
   ]);
 
