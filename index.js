@@ -14,7 +14,7 @@ const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
 const USERS_SHEET_NAME = process.env.USERS_SHEET_NAME || '';
 const SUBJECTS_SHEET_NAME = process.env.SUBJECTS_SHEET_NAME || '';
-const BATCHES_SHEET_NAME = process.env.BATCHES_SHEET_NAME || '';
+const YEARS_SHEET_NAME = process.env.YEARS_SHEET_NAME || process.env.BATCHES_SHEET_NAME || '';
 
 if (
   !BOT_TOKEN ||
@@ -47,7 +47,7 @@ const folderCache = new Map();
 const handledMessages = new Set();
 const MAX_HANDLED_MESSAGES = 5000;
 
-// تخزين حالات المستخدمين
+// تخزين حالات المستخدمين والجلسات
 const userSessions = new Map();
 const browseState = new Map();
 
@@ -56,13 +56,13 @@ let allowedUsersCache = new Map();
 let allowedUsersCacheAt = 0;
 let subjectsCache = [];
 let subjectsCacheAt = 0;
-let batchesCache = new Map();
-let batchesCacheAt = 0;
+let yearsMapCache = new Map();
+let yearsMapCacheAt = 0;
 const CACHE_TTL_MS = 60 * 1000;
 
 let resolvedUsersSheetTitle = null;
 let resolvedSubjectsSheetTitle = null;
-let resolvedBatchesSheetTitle = null;
+let resolvedYearsSheetTitle = null;
 
 function enqueueUpload(task) {
   const result = uploadQueue.then(task, task);
@@ -227,7 +227,7 @@ function parsePinLine(caption, knownDoctors = []) {
 }
 
 async function resolveSheetTitles() {
-  if (resolvedUsersSheetTitle && resolvedSubjectsSheetTitle && resolvedBatchesSheetTitle) return;
+  if (resolvedUsersSheetTitle && resolvedSubjectsSheetTitle && resolvedYearsSheetTitle) return;
 
   const spreadsheet = await sheets.spreadsheets.get({
     spreadsheetId: GOOGLE_SHEET_ID,
@@ -241,7 +241,7 @@ async function resolveSheetTitles() {
 
   resolvedUsersSheetTitle = USERS_SHEET_NAME || allSheets[0]?.properties?.title || 'users';
   resolvedSubjectsSheetTitle = SUBJECTS_SHEET_NAME || (allSheets.length > 1 ? allSheets[1]?.properties?.title : 'subjects');
-  resolvedBatchesSheetTitle = BATCHES_SHEET_NAME || (allSheets.length > 2 ? allSheets[2]?.properties?.title : 'batches');
+  resolvedYearsSheetTitle = YEARS_SHEET_NAME || (allSheets.length > 2 ? allSheets[2]?.properties?.title : 'years');
 }
 
 async function getAllowedUsers() {
@@ -264,7 +264,7 @@ async function getAllowedUsers() {
     const telegramId = String(row[0] || '').trim();
     const name = String(row[1] || '').trim();
     const role = String(row[2] || '').trim().toLowerCase();
-    const batch = String(row[3] || '').trim().replace(/[^\d]/g, '');
+    const userYear = String(row[3] || '').trim();
 
     const isAdmin = ['admin', 'مدير', 'ادمن'].includes(role);
     const isActive = isAdmin || ['yes', 'true', '1', 'نعم', 'فعال', 'مفعل', 'member'].includes(role);
@@ -273,7 +273,7 @@ async function getAllowedUsers() {
       users.set(telegramId, {
         name: name || telegramId,
         isAdmin,
-        batch
+        userYear: normalizeArabic(userYear)
       });
     }
   }
@@ -283,14 +283,14 @@ async function getAllowedUsers() {
   return users;
 }
 
-async function getBatchesData() {
+async function getYearsDriveMap() {
   const now = Date.now();
-  if (now - batchesCacheAt < CACHE_TTL_MS && batchesCache.size > 0) {
-    return batchesCache;
+  if (now - yearsMapCacheAt < CACHE_TTL_MS && yearsMapCache.size > 0) {
+    return yearsMapCache;
   }
 
   await resolveSheetTitles();
-  const escapedTitle = resolvedBatchesSheetTitle.replace(/'/g, "''");
+  const escapedTitle = resolvedYearsSheetTitle.replace(/'/g, "''");
 
   try {
     const result = await sheets.spreadsheets.values.get({
@@ -299,20 +299,21 @@ async function getBatchesData() {
       majorDimension: 'ROWS'
     });
 
-    const bMap = new Map();
+    const yMap = new Map();
     for (const row of result.data.values || []) {
-      const bNum = String(row[0] || '').trim().replace(/[^\d]/g, '');
+      const yearName = String(row[0] || '').trim();
       const folderId = String(row[1] || '').trim();
-      if (bNum && folderId) {
-        bMap.set(bNum, folderId);
+      if (yearName && folderId) {
+        yMap.set(normalizeArabic(yearName), folderId);
+        yMap.set(yearName.replace(/[^\d]/g, ''), folderId);
       }
     }
-    batchesCache = bMap;
-    batchesCacheAt = now;
+    yearsMapCache = yMap;
+    yearsMapCacheAt = now;
   } catch (err) {
-    console.log('لم يتم العثور على تبويب batches، الاعتماد على المجلد الافتراضي.');
+    console.log('لم يتم العثور على تبويب years/batches، الاعتماد على المجلد الافتراضي.');
   }
-  return batchesCache;
+  return yearsMapCache;
 }
 
 async function getSubjectsData() {
@@ -346,6 +347,7 @@ async function getSubjectsData() {
   const semesterIdx = headers.indexOf('semester');
   const practicalIdx = headers.indexOf('practical');
   const stageIdx = headers.indexOf('stage');
+  const correctionsIdx = headers.indexOf('corrections') !== -1 ? headers.indexOf('corrections') : headers.indexOf('index_link');
 
   const parsed = [];
 
@@ -356,6 +358,7 @@ async function getSubjectsData() {
     let batch = String(row[batchIdx] !== undefined ? row[batchIdx] : '').trim();
     let year = String(row[yearIdx] !== undefined ? row[yearIdx] : '').trim();
     let semester = String(row[semesterIdx] !== undefined ? row[semesterIdx] : '').trim();
+    const correctionsLink = String(correctionsIdx !== -1 && row[correctionsIdx] !== undefined ? row[correctionsIdx] : '').trim();
 
     if (!hashtag && !folderName) continue;
 
@@ -371,7 +374,6 @@ async function getSubjectsData() {
     if (/ثان|2/i.test(semester)) semester = 'الفصل الثاني';
     else if (/اول|أول|1/i.test(semester)) semester = 'الفصل الأول';
 
-    // فحص هل المادة تحتوي على عملي أو ستاج
     const hasPractical = practicalIdx !== -1 && Boolean(String(row[practicalIdx] || '').trim());
     const hasStage = stageIdx !== -1 && Boolean(String(row[stageIdx] || '').trim());
 
@@ -396,9 +398,11 @@ async function getSubjectsData() {
       folderName: folderName || hashtag,
       batch,
       year,
+      normYear: normalizeArabic(year),
       semester,
       hasPractical,
       hasStage,
+      correctionsLink,
       theory: [...new Set(theorySections)],
       extra: [...new Set(extraSections)],
       courses: [...new Set(coursesSections)]
@@ -425,7 +429,7 @@ function extractTags(caption) {
   return matches.map((t) => t.replace(/^#/, '').trim());
 }
 
-async function determineFolderAndFileName(caption, originalFileName, senderBatch = '', isAdmin = false) {
+async function determineFolderAndFileName(caption, originalFileName, senderYear = '', isAdmin = false) {
   const tags = extractTags(caption);
   const normTags = tags.map(normalizeArabic);
   const fullTextNorm = normalizeArabic(caption);
@@ -460,16 +464,17 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     throw new Error('لم يتم التعرف على اسم المادة في الرسالة.');
   }
 
-  if (!isAdmin && senderBatch) {
-    const matchWithBatch = matchedRows.find((r) => r.batch === senderBatch);
-    if (!matchWithBatch) {
-      throw new Error(`صلاحياتك محصورة بمواد دفعة ${senderBatch} فقط.`);
+  // التحقق من صلاحية العضو بالسنة
+  if (!isAdmin && senderYear) {
+    const matchWithYear = matchedRows.find((r) => r.normYear === senderYear || r.batch === senderYear);
+    if (!matchWithYear) {
+      throw new Error(`صلاحياتك محصورة بمواد ${senderYear} فقط.`);
     }
-    matchedRows = [matchWithBatch];
+    matchedRows = [matchWithYear];
   }
 
   const selectedSubject = matchedRows[0];
-  const { folderName, year, semester, batch } = selectedSubject;
+  const { folderName, year, semester } = selectedSubject;
 
   const pinInfo = parsePinLine(caption, selectedSubject.theory);
   let finalFileName = originalFileName;
@@ -545,7 +550,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     folderPath: finalPath,
     fileName: finalFileName,
     selectedSubject,
-    batch,
+    year,
     isFullyDetermined: Boolean(isStage || isPractical || isCourses || isExtra || pinInfo || chosenSection)
   };
 }
@@ -627,13 +632,13 @@ function getFileActionButtons(driveFileId, subjectIdx) {
   ]);
 }
 
-async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subjectIdx }) {
+async function executeUpload({ ctx, fileInfo, folderPath, fileName, year, subjectIdx }) {
   await ctx.reply(`جاري حفظ الملف وأرشفته: ${escapeHtml(fileName)}...`, { parse_mode: 'HTML' });
 
   enqueueUpload(async () => {
     try {
-      const batchesMap = await getBatchesData();
-      const targetRootId = batchesMap.get(batch) || GOOGLE_DRIVE_FOLDER_ID;
+      const yearsMap = await getYearsDriveMap();
+      const targetRootId = yearsMap.get(normalizeArabic(year)) || GOOGLE_DRIVE_FOLDER_ID;
 
       const fileLink = await ctx.telegram.getFileLink(fileInfo.fileId);
       const response = await axios.get(fileLink.href, {
@@ -663,7 +668,7 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subje
 
       userSessions.set(`file_info_${driveFileId}`, {
         ownerId: String(ctx.from.id),
-        batch
+        year
       });
 
       await ctx.reply(
@@ -683,12 +688,10 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subje
   });
 }
 
-// دالة توليد أزرار الأقسام بذكاء حسب نوع المادة
 function generateTypeKeyboard(sub, backText) {
   const rows = [];
   const topRow = ['📖 نظري'];
 
-  // إظهار عملي أو ستاج حسب طبيعة المادة بالشيت
   if (sub.hasPractical) {
     topRow.push('🔬 عملي');
   } else if (sub.hasStage) {
@@ -697,6 +700,11 @@ function generateTypeKeyboard(sub, backText) {
 
   rows.push(topRow);
   rows.push(['📝 دورات', '✨ اكسترا']);
+
+  if (sub.correctionsLink) {
+    rows.push(['🔍 تصويبات المادة']);
+  }
+
   rows.push([backText, '🏠 القائمة الرئيسية']);
 
   return Markup.keyboard(rows).resize();
@@ -761,28 +769,23 @@ bot.on('text', async (ctx, next) => {
   }
 
   // 2. اختيار السنة الدراسية
-  const yearMap = {
-    'السنة الثانية': { batch: '2030', year: 'السنة الثانية' },
-    'السنة الثالثة': { batch: '2029', year: 'السنة الثالثة' },
-    'السنة الرابعة': { batch: '2028', year: 'السنة الرابعة' },
-    'السنة الخامسة': { batch: '2027', year: 'السنة الخامسة' }
-  };
+  const yearList = ['السنة الثانية', 'السنة الثالثة', 'السنة الرابعة', 'السنة الخامسة'];
 
-  if (yearMap[text]) {
-    const { batch, year } = yearMap[text];
+  if (yearList.includes(text)) {
+    const year = text;
     const subjects = await getSubjectsData();
-    const batchSubs = subjects.filter((s) => s.batch === batch);
+    const yearSubs = subjects.filter((s) => s.year === year || s.normYear === normalizeArabic(year));
 
-    if (batchSubs.length === 0) {
+    if (yearSubs.length === 0) {
       return ctx.reply(`لا توجد مواد مدرجة حالياً لـ ${escapeHtml(year)}.`, YEARS_KEYBOARD);
     }
 
-    browseState.set(userId, { step: 'SUBJECTS', batch, year });
+    browseState.set(userId, { step: 'SUBJECTS', year });
 
     const subRows = [];
-    for (let i = 0; i < batchSubs.length; i += 2) {
-      const row = [batchSubs[i].hashtag];
-      if (batchSubs[i + 1]) row.push(batchSubs[i + 1].hashtag);
+    for (let i = 0; i < yearSubs.length; i += 2) {
+      const row = [yearSubs[i].hashtag];
+      if (yearSubs[i + 1]) row.push(yearSubs[i + 1].hashtag);
       subRows.push(row);
     }
     subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
@@ -804,14 +807,13 @@ bot.on('text', async (ctx, next) => {
   if (state && state.step === 'SUBJECTS') {
     const subjects = await getSubjectsData();
     const selectedSub = subjects.find(
-      (s) => s.batch === state.batch && (s.hashtag === text || s.folderName === text)
+      (s) => s.normYear === normalizeArabic(state.year) && (s.hashtag === text || s.folderName === text)
     );
 
     if (selectedSub) {
       const subIdx = subjects.indexOf(selectedSub);
       browseState.set(userId, {
         step: 'TYPES',
-        batch: state.batch,
         year: state.year,
         subIdx,
         sub: selectedSub
@@ -828,14 +830,14 @@ bot.on('text', async (ctx, next) => {
 
   if (text === '🔙 رجوع للمواد' && state) {
     const subjects = await getSubjectsData();
-    const batchSubs = subjects.filter((s) => s.batch === state.batch);
+    const yearSubs = subjects.filter((s) => s.year === state.year || s.normYear === normalizeArabic(state.year));
 
-    browseState.set(userId, { step: 'SUBJECTS', batch: state.batch, year: state.year });
+    browseState.set(userId, { step: 'SUBJECTS', year: state.year });
 
     const subRows = [];
-    for (let i = 0; i < batchSubs.length; i += 2) {
-      const row = [batchSubs[i].hashtag];
-      if (batchSubs[i + 1]) row.push(batchSubs[i + 1].hashtag);
+    for (let i = 0; i < yearSubs.length; i += 2) {
+      const row = [yearSubs[i].hashtag];
+      if (yearSubs[i + 1]) row.push(yearSubs[i + 1].hashtag);
       subRows.push(row);
     }
     subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
@@ -844,6 +846,11 @@ bot.on('text', async (ctx, next) => {
       parse_mode: 'HTML',
       ...Markup.keyboard(subRows).resize()
     });
+  }
+
+  // معالجة زر التصويبات
+  if (text === '🔍 تصويبات المادة' && state && state.sub && state.sub.correctionsLink) {
+    return handleCorrectionsRequest(ctx, state.sub);
   }
 
   // 4. اختيار القسم
@@ -904,7 +911,6 @@ bot.on('text', async (ctx, next) => {
   if (text === '🔙 رجوع للأقسام' && state) {
     browseState.set(userId, {
       step: 'TYPES',
-      batch: state.batch,
       year: state.year,
       subIdx: state.subIdx,
       sub: state.sub
@@ -918,7 +924,7 @@ bot.on('text', async (ctx, next) => {
     );
   }
 
-  // 5. اختيار الدكتور أو (كل المحاضرات)
+  // 5. اختيار الدكتور
   if (state && state.step === 'DOCTORS') {
     let chosenDoc = '';
     if (text === '📁 كل المحاضرات') {
@@ -963,7 +969,6 @@ bot.on('text', async (ctx, next) => {
       } else {
         browseState.set(userId, {
           step: 'TYPES',
-          batch: state.batch,
           year: state.year,
           subIdx: state.subIdx,
           sub: state.sub
@@ -986,13 +991,61 @@ bot.on('text', async (ctx, next) => {
   return next();
 });
 
+// معالجة تصدير التصويبات
+async function handleCorrectionsRequest(ctx, sub) {
+  const url = sub.correctionsLink;
+
+  // فحص هل الرابط هو Google Sheet يحتوي على gid
+  const sheetMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+).*gid=([0-9]+)/);
+
+  if (sheetMatch) {
+    const spreadsheetId = sheetMatch[1];
+    const gid = sheetMatch[2];
+
+    await ctx.reply('طلبك على قدم وساق، لحظات ويتم تجهيز ملف تصويبات المادة...');
+
+    try {
+      const exportUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=pdf&gid=${gid}&size=a4&portrait=true&fitw=true&gridlines=true`;
+      const token = (await oauth2Client.getAccessToken()).token;
+
+      const response = await axios.get(exportUrl, {
+        headers: { Authorization: `Bearer ${token}` },
+        responseType: 'arraybuffer'
+      });
+
+      const buffer = Buffer.from(response.data);
+
+      return ctx.replyWithDocument(
+        {
+          source: buffer,
+          filename: `${sub.hashtag} - جدول وتصويبات المادة.pdf`
+        },
+        {
+          caption: `📄 <b>تصويبات ${escapeHtml(sub.hashtag)}</b>\n\n🔗 <a href="${url}">رابط الشيت المباشر</a>`,
+          parse_mode: 'HTML'
+        }
+      );
+    } catch (err) {
+      console.error('خطأ تصدير شيت التصويبات:', err?.message);
+    }
+  }
+
+  // إذا كان رابط تيليغرام أو رابطاً خارجياً
+  return ctx.reply(
+    `<b>تصويبات مادة ${escapeHtml(sub.hashtag)}:</b>\n\n` +
+    `تفضل بالاطلاع على آخر التحديثات عبر الرابط التالي:\n` +
+    `🔗 <a href="${url}">اضغط هنا للانتقال للتصويبات</a>`,
+    { parse_mode: 'HTML' }
+  );
+}
+
 async function fetchAndShowFilesKeyboard(ctx, sub, type, sectionName) {
   const userId = String(ctx.from.id);
   await ctx.reply('طلبك على قدم وساق، لحظات ويتم تحضير القائمة...');
 
   try {
-    const batchesMap = await getBatchesData();
-    const rootParentId = batchesMap.get(sub.batch) || GOOGLE_DRIVE_FOLDER_ID;
+    const yearsMap = await getYearsDriveMap();
+    const rootParentId = yearsMap.get(normalizeArabic(sub.year)) || GOOGLE_DRIVE_FOLDER_ID;
 
     const pathArr = [sub.year, sub.semester, sub.folderName, type, sectionName].filter(Boolean);
     const targetFolderId = await getOrCreateFolderPath(pathArr, rootParentId);
@@ -1108,14 +1161,14 @@ bot.on(['document', 'photo'], async (ctx) => {
     processPlan = await determineFolderAndFileName(
       ctx.message.caption?.trim(),
       fileInfo.fileName,
-      allowedUser.batch,
+      allowedUser.userYear,
       allowedUser.isAdmin
     );
   } catch (err) {
     return ctx.reply(`تنبيه: ${err.message}`);
   }
 
-  const { folderPath, fileName, selectedSubject, batch, isFullyDetermined } = processPlan;
+  const { folderPath, fileName, selectedSubject, year, isFullyDetermined } = processPlan;
   const subIdx = subjectsCache.indexOf(selectedSubject);
 
   if (!isFullyDetermined) {
@@ -1124,7 +1177,7 @@ bot.on(['document', 'photo'], async (ctx) => {
       fileInfo,
       fileName,
       selectedSubject,
-      batch,
+      year,
       subIdx,
       expiresAt: Date.now() + 15 * 60 * 1000
     });
@@ -1147,7 +1200,7 @@ bot.on(['document', 'photo'], async (ctx) => {
     );
   }
 
-  await executeUpload({ ctx, fileInfo, folderPath, fileName, batch, subjectIdx: subIdx });
+  await executeUpload({ ctx, fileInfo, folderPath, fileName, year, subjectIdx: subIdx });
 });
 
 bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
@@ -1158,13 +1211,13 @@ bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
   const session = userSessions.get(sessionId);
   if (!session) return ctx.editMessageText('انتهت صلاحية الجلسة.');
 
-  const { selectedSubject, batch, fileInfo, fileName, subIdx } = session;
+  const { selectedSubject, year, fileInfo, fileName, subIdx } = session;
 
-  if (type === 'ستاج') {
+  if (type === 'ستاج' || type === 'عملي') {
     userSessions.delete(sessionId);
-    await ctx.editMessageText('تم اعتماد قسم ستاج، جاري الحفظ...');
-    const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, 'ستاج'].filter(Boolean);
-    return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, subjectIdx: subIdx });
+    await ctx.editMessageText(`تم اعتماد قسم ${escapeHtml(type)}، جاري الحفظ...`, { parse_mode: 'HTML' });
+    const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type].filter(Boolean);
+    return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, year, subjectIdx: subIdx });
   }
 
   let list = [];
@@ -1176,7 +1229,7 @@ bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
     userSessions.delete(sessionId);
     await ctx.editMessageText(`تم اعتماد ${escapeHtml(type)}، جاري الحفظ...`, { parse_mode: 'HTML' });
     const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type].filter(Boolean);
-    return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, subjectIdx: subIdx });
+    return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, year, subjectIdx: subIdx });
   }
 
   session.type = type;
@@ -1203,7 +1256,7 @@ bot.action(/^btn_doc:(.+):(.+)$/, async (ctx) => {
   const session = userSessions.get(sessionId);
   if (!session) return ctx.editMessageText('انتهت صلاحية الجلسة.');
 
-  const { selectedSubject, batch, type, fileInfo, fileName, subIdx } = session;
+  const { selectedSubject, year, type, fileInfo, fileName, subIdx } = session;
   userSessions.delete(sessionId);
 
   let chosenDoc = '';
@@ -1216,7 +1269,7 @@ bot.action(/^btn_doc:(.+):(.+)$/, async (ctx) => {
 
   await ctx.editMessageText('طلبك على قدم وساق، جاري حفظ الملف...');
   const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type, chosenDoc].filter(Boolean);
-  return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, subjectIdx: subIdx });
+  return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, year, subjectIdx: subIdx });
 });
 
 bot.action(/^btn_cancel:(.+)$/, async (ctx) => {
@@ -1296,15 +1349,15 @@ bot.action(/^mov_other_subs:(.+):(\d+)$/, async (ctx) => {
 
   const subjects = await getSubjectsData();
   const curSub = subjects[curSubIdx];
-  const sameBatchSubs = subjects.filter((s) => s.batch === curSub.batch);
+  const sameYearSubs = subjects.filter((s) => s.normYear === curSub.normYear);
 
   const subButtons = [];
-  for (let i = 0; i < sameBatchSubs.length; i += 2) {
-    const idx1 = subjects.indexOf(sameBatchSubs[i]);
-    const row = [Markup.button.callback(sameBatchSubs[i].folderName, `mov_sub_picked:${fileId}:${idx1}`)];
-    if (sameBatchSubs[i + 1]) {
-      const idx2 = subjects.indexOf(sameBatchSubs[i + 1]);
-      row.push(Markup.button.callback(sameBatchSubs[i + 1].folderName, `mov_sub_picked:${fileId}:${idx2}`));
+  for (let i = 0; i < sameYearSubs.length; i += 2) {
+    const idx1 = subjects.indexOf(sameYearSubs[i]);
+    const row = [Markup.button.callback(sameYearSubs[i].folderName, `mov_sub_picked:${fileId}:${idx1}`)];
+    if (sameYearSubs[i + 1]) {
+      const idx2 = subjects.indexOf(sameYearSubs[i + 1]);
+      row.push(Markup.button.callback(sameYearSubs[i + 1].folderName, `mov_sub_picked:${fileId}:${idx2}`));
     }
     subButtons.push(row);
   }
@@ -1349,7 +1402,7 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
 
   if (type === 'ستاج' || type === 'عملي') {
     const finalPath = [sub.year, sub.semester, sub.folderName, type].filter(Boolean);
-    return doMove(ctx, fileId, finalPath, sub.batch);
+    return doMove(ctx, fileId, finalPath, sub.year);
   }
 
   let list = [];
@@ -1359,7 +1412,7 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
 
   if (list.length === 0) {
     const finalPath = [sub.year, sub.semester, sub.folderName, type].filter(Boolean);
-    return doMove(ctx, fileId, finalPath, sub.batch);
+    return doMove(ctx, fileId, finalPath, sub.year);
   }
 
   const docButtons = [];
@@ -1395,7 +1448,7 @@ bot.action(/^mov_f:(.+):(\d+):(.+):(.+)$/, async (ctx) => {
   }
 
   const finalPath = [sub.year, sub.semester, sub.folderName, type, chosenDoc].filter(Boolean);
-  return doMove(ctx, fileId, finalPath, sub.batch);
+  return doMove(ctx, fileId, finalPath, sub.year);
 });
 
 bot.action('mov_cancel', async (ctx) => {
@@ -1403,11 +1456,11 @@ bot.action('mov_cancel', async (ctx) => {
   await ctx.editMessageText('تم إلغاء عملية النقل.');
 });
 
-async function doMove(ctx, fileId, finalPath, batch) {
+async function doMove(ctx, fileId, finalPath, year) {
   try {
     await ctx.editMessageText('طلبك على قدم وساق، جاري نقل الملف...');
-    const batchesMap = await getBatchesData();
-    const targetRootId = batchesMap.get(batch) || GOOGLE_DRIVE_FOLDER_ID;
+    const yearsMap = await getYearsDriveMap();
+    const targetRootId = yearsMap.get(normalizeArabic(year)) || GOOGLE_DRIVE_FOLDER_ID;
 
     const targetFolderId = await getOrCreateFolderPath(finalPath, targetRootId);
     const fileMeta = await drive.files.get({ fileId, fields: 'parents' });
