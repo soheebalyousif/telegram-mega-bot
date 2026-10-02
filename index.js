@@ -169,6 +169,7 @@ function parseArabicLectureNumber(text) {
   return '';
 }
 
+// كشف ذكي لسطر الدبوس مع دعم كامل لـ أ.د. والدكتور
 function parsePinLine(caption, knownDoctors = []) {
   if (!caption) return null;
   const lines = caption.split('\n');
@@ -188,10 +189,32 @@ function parsePinLine(caption, knownDoctors = []) {
   function isDoctor(str) {
     if (!str) return false;
     const norm = normalizeArabic(str);
-    if (norm.startsWith('د ') || norm.startsWith('د.') || norm.startsWith('الدكتور') || norm.startsWith('الدكتوره')) {
+    const normNoDots = norm.replace(/[.]/g, '');
+
+    // التحقق من ألقاب الدكاترة بجميع أشكالها
+    if (
+      norm.startsWith('د ') ||
+      norm.startsWith('د.') ||
+      norm.startsWith('ا.د') ||
+      norm.startsWith('أ.د') ||
+      normNoDots.startsWith('اد ') ||
+      normNoDots.startsWith('ا د ') ||
+      norm.startsWith('الدكتور') ||
+      norm.startsWith('الدكتوره') ||
+      norm.startsWith('استاذ دكتور') ||
+      norm.startsWith('الاستاذ الدكتور') ||
+      norm.startsWith('بروفيسور')
+    ) {
       return true;
     }
-    return knownDoctors.some((doc) => norm.includes(normalizeArabic(doc)));
+
+    // مطابقة اسم الدكتور المسجل بالشيت
+    return knownDoctors.some((doc) => {
+      const cleanDocNorm = normalizeArabic(doc)
+        .replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتورة|الاستاذ الدكتور|أستاذ دكتور)\s*/i, '')
+        .trim();
+      return cleanDocNorm.length > 2 && norm.includes(cleanDocNorm);
+    });
   }
 
   let titlePart = '';
@@ -215,7 +238,7 @@ function parsePinLine(caption, knownDoctors = []) {
 
   const cleanTitle = titlePart.replace(/[\\/:*?"<>|]/g, '').replace(/\.+$/, '').trim();
   const cleanDoctor = doctorPart
-    .replace(/^(د\.?|الدكتور|الدكتورة)\s*/i, '')
+    .replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتورة|الاستاذ الدكتور|الأستاذ الدكتور|استاذ دكتور|أستاذ دكتور|بروفيسور)\s*/i, '')
     .replace(/[\\/:*?"<>|.]/g, '')
     .trim();
 
@@ -241,13 +264,8 @@ async function resolveSheetTitles() {
 
   const titles = allSheets.map((s) => s.properties?.title || '');
 
-  // تبويب المستخدمين
   resolvedUsersSheetTitle = USERS_SHEET_NAME || titles.find((t) => ['users', 'user'].includes(t.toLowerCase())) || titles[0] || 'users';
-
-  // تبويب المواد
   resolvedSubjectsSheetTitle = SUBJECTS_SHEET_NAME || titles.find((t) => ['subjects', 'subject', 'المواد'].includes(t.toLowerCase())) || (allSheets.length > 1 ? titles[1] : 'subjects');
-
-  // تبويب الدفعات
   resolvedBatchesSheetTitle = BATCHES_SHEET_NAME || titles.find((t) => ['batches', 'batch', 'years', 'الدفعات'].includes(t.toLowerCase())) || (allSheets.length > 2 ? titles[2] : 'batches');
 }
 
@@ -552,10 +570,25 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     }
   }
 
+  // إضافة د. إذا كان القسم يمثل طبيباً
+  if (chosenSection && !chosenSection.startsWith('د.') && !chosenSection.startsWith('د ')) {
+    const isTopicOnly = ['الجراثيم العام', 'الفيروسات العام', 'الجراثيم الخاص', 'الفيروسات الخاص', 'البولية', 'الهضمية', 'الدموية', 'الصدرية', 'النفسية', 'الغدية', 'القلبية', 'الرثوية', 'العصبية', 'منهجية البحث', 'الوبائيات', 'الإحصاء الطبي'].some(t => normalizeArabic(t) === normalizeArabic(chosenSection));
+    if (!isTopicOnly) {
+      chosenSection = `د. ${chosenSection}`;
+    }
+  }
+
+  // دعم المجلدات المتداخلة ذات السلاش (Surgery 3 / Urology)
   const finalPath = [];
   if (year) finalPath.push(year);
   if (semester) finalPath.push(semester);
-  finalPath.push(folderName);
+
+  if (folderName.includes('/')) {
+    finalPath.push(...folderName.split('/').map((f) => f.trim()).filter(Boolean));
+  } else {
+    finalPath.push(folderName);
+  }
+
   finalPath.push(...typeFolders);
   if (chosenSection) finalPath.push(chosenSection);
 
@@ -652,7 +685,6 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year,
   enqueueUpload(async () => {
     try {
       const batchesMap = await getBatchesDriveMap();
-      // البحث بالرقم (2028) أولاً ثم بالسنة
       const targetRootId = batchesMap.get(String(batch)) || 
                            batchesMap.get(normalizeArabic(year)) || 
                            GOOGLE_DRIVE_FOLDER_ID;
@@ -754,7 +786,7 @@ bot.on('text', async (ctx, next) => {
   const userId = String(ctx.from.id);
   const text = ctx.message.text.trim();
 
-  // إعادة التسمية للأعضاء
+  // إعادة التسمية
   const renameState = userSessions.get(`wait_ren_${userId}`);
   if (renameState) {
     userSessions.delete(`wait_ren_${userId}`);
@@ -802,8 +834,8 @@ bot.on('text', async (ctx, next) => {
 
     const subRows = [];
     for (let i = 0; i < yearSubs.length; i += 2) {
-      const row = [yearSubs[i].hashtag];
-      if (yearSubs[i + 1]) row.push(yearSubs[i + 1].hashtag);
+      const row = [batchSubsName(yearSubs[i])];
+      if (yearSubs[i + 1]) row.push(batchSubsName(yearSubs[i + 1]));
       subRows.push(row);
     }
     subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
@@ -812,6 +844,10 @@ bot.on('text', async (ctx, next) => {
       parse_mode: 'HTML',
       ...Markup.keyboard(subRows).resize()
     });
+  }
+
+  function batchSubsName(s) {
+    return s.hashtag.split(/[،,]/)[0].trim();
   }
 
   if (text === '🔙 رجوع للسنوات') {
@@ -825,7 +861,7 @@ bot.on('text', async (ctx, next) => {
   if (state && state.step === 'SUBJECTS') {
     const subjects = await getSubjectsData();
     const selectedSub = subjects.find(
-      (s) => s.normYear === normalizeArabic(state.year) && (s.hashtag === text || s.folderName === text)
+      (s) => s.normYear === normalizeArabic(state.year) && (s.normHashtag.includes(normalizeArabic(text)) || s.folderName === text)
     );
 
     if (selectedSub) {
@@ -854,8 +890,8 @@ bot.on('text', async (ctx, next) => {
 
     const subRows = [];
     for (let i = 0; i < yearSubs.length; i += 2) {
-      const row = [yearSubs[i].hashtag];
-      if (yearSubs[i + 1]) row.push(yearSubs[i + 1].hashtag);
+      const row = [batchSubsName(yearSubs[i])];
+      if (yearSubs[i + 1]) row.push(batchSubsName(yearSubs[i + 1]));
       subRows.push(row);
     }
     subRows.push(['🔙 رجوع للسنوات', '🏠 القائمة الرئيسية']);
@@ -942,7 +978,7 @@ bot.on('text', async (ctx, next) => {
     );
   }
 
-  // 5. اختيار الدكتور
+  // 5. اختيار الدكتور أو (كل المحاضرات)
   if (state && state.step === 'DOCTORS') {
     let chosenDoc = '';
     if (text === '📁 كل المحاضرات') {
@@ -1053,18 +1089,34 @@ async function handleCorrectionsRequest(ctx, sub) {
   );
 }
 
+function buildTargetFolderPath(sub, type, sectionName) {
+  const finalPath = [];
+  if (sub.year) finalPath.push(sub.year);
+  if (sub.semester) finalPath.push(sub.semester);
+
+  if (sub.folderName.includes('/')) {
+    finalPath.push(...sub.folderName.split('/').map((f) => f.trim()).filter(Boolean));
+  } else {
+    finalPath.push(sub.folderName);
+  }
+
+  if (type) finalPath.push(type);
+  if (sectionName) finalPath.push(sectionName);
+
+  return finalPath;
+}
+
 async function fetchAndShowFilesKeyboard(ctx, sub, type, sectionName) {
   const userId = String(ctx.from.id);
   await ctx.reply('طلبك على قدم وساق، لحظات ويتم تحضير القائمة...');
 
   try {
     const batchesMap = await getBatchesDriveMap();
-    // البحث بالدفعة (2028) أولاً ثم بالسنة
     const rootParentId = batchesMap.get(String(sub.batch)) || 
                          batchesMap.get(normalizeArabic(sub.year)) || 
                          GOOGLE_DRIVE_FOLDER_ID;
 
-    const pathArr = [sub.year, sub.semester, sub.folderName, type, sectionName].filter(Boolean);
+    const pathArr = buildTargetFolderPath(sub, type, sectionName);
     const targetFolderId = await getOrCreateFolderPath(pathArr, rootParentId);
 
     const driveRes = await drive.files.list({
@@ -1235,7 +1287,7 @@ bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
   if (type === 'ستاج' || type === 'عملي') {
     userSessions.delete(sessionId);
     await ctx.editMessageText(`تم اعتماد قسم ${escapeHtml(type)}، جاري الحفظ...`, { parse_mode: 'HTML' });
-    const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type].filter(Boolean);
+    const finalPath = buildTargetFolderPath(selectedSubject, type, '');
     return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, year, subjectIdx: subIdx });
   }
 
@@ -1247,7 +1299,7 @@ bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
   if (list.length === 0) {
     userSessions.delete(sessionId);
     await ctx.editMessageText(`تم اعتماد ${escapeHtml(type)}، جاري الحفظ...`, { parse_mode: 'HTML' });
-    const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type].filter(Boolean);
+    const finalPath = buildTargetFolderPath(selectedSubject, type, '');
     return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, year, subjectIdx: subIdx });
   }
 
@@ -1284,10 +1336,14 @@ bot.action(/^btn_doc:(.+):(.+)$/, async (ctx) => {
     if (type === 'دورات') list = selectedSubject.courses;
     else if (type === 'اكسترا') list = selectedSubject.extra;
     chosenDoc = list[Number(docIdx)] || '';
+
+    if (chosenDoc && !chosenDoc.startsWith('د.') && !chosenDoc.startsWith('د ')) {
+      chosenDoc = `د. ${chosenDoc}`;
+    }
   }
 
   await ctx.editMessageText('طلبك على قدم وساق، جاري حفظ الملف...');
-  const finalPath = [selectedSubject.year, selectedSubject.semester, selectedSubject.folderName, type, chosenDoc].filter(Boolean);
+  const finalPath = buildTargetFolderPath(selectedSubject, type, chosenDoc);
   return executeUpload({ ctx, fileInfo, folderPath: finalPath, fileName, batch, year, subjectIdx: subIdx });
 });
 
@@ -1420,7 +1476,7 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
   const sub = subjects[subIdx];
 
   if (type === 'ستاج' || type === 'عملي') {
-    const finalPath = [sub.year, sub.semester, sub.folderName, type].filter(Boolean);
+    const finalPath = buildTargetFolderPath(sub, type, '');
     return doMove(ctx, fileId, finalPath, sub.batch, sub.year);
   }
 
@@ -1430,7 +1486,7 @@ bot.action(/^mov_t:(.+):(\d+):(.+)$/, async (ctx) => {
   else if (type === 'اكسترا') list = sub.extra;
 
   if (list.length === 0) {
-    const finalPath = [sub.year, sub.semester, sub.folderName, type].filter(Boolean);
+    const finalPath = buildTargetFolderPath(sub, type, '');
     return doMove(ctx, fileId, finalPath, sub.batch, sub.year);
   }
 
@@ -1464,9 +1520,13 @@ bot.action(/^mov_f:(.+):(\d+):(.+):(.+)$/, async (ctx) => {
     if (type === 'دورات') list = sub.courses;
     else if (type === 'اكسترا') list = sub.extra;
     chosenDoc = list[Number(docIdx)] || '';
+
+    if (chosenDoc && !chosenDoc.startsWith('د.') && !chosenDoc.startsWith('د ')) {
+      chosenDoc = `د. ${chosenDoc}`;
+    }
   }
 
-  const finalPath = [sub.year, sub.semester, sub.folderName, type, chosenDoc].filter(Boolean);
+  const finalPath = buildTargetFolderPath(sub, type, chosenDoc);
   return doMove(ctx, fileId, finalPath, sub.batch, sub.year);
 });
 
@@ -1517,7 +1577,7 @@ function startHealthServer() {
 async function startBot() {
   try {
     await bot.launch({ dropPendingUpdates: false });
-    console.log('Bot is running successfully with multi-batch mapping.');
+    console.log('Bot is running successfully with all updates.');
   } catch (err) {
     console.error('فشل تشغيل البوت:', err?.message);
     process.exit(1);
