@@ -89,7 +89,7 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-// تطبيع ذكي للنصوص يفصل الأرقام عن الحروف تلقائياً
+// تطبيع ذكي للنصوص يفصل الأرقام عن الحروف
 function normalizeArabic(str) {
   return String(str || '')
     .trim()
@@ -453,7 +453,7 @@ async function getSubjectsData() {
       theory: [...new Set(theorySections)],
       extra: [...new Set(extraSections)],
       courses: [...new Set(coursesSections)],
-      rowIndex: i + 1 // رقم الصف في قوقل شيت لتسهيل التعديل
+      rowIndex: i + 1
     });
   }
 
@@ -477,60 +477,69 @@ function extractTags(caption) {
   return matches.map((t) => t.replace(/^#/, '').trim());
 }
 
-async function determineFolderAndFileName(caption, originalFileName, senderBatch = '', senderYear = '', isAdmin = false) {
+// السلّم الصارم لتحديد المادة: الهاشتاق العربي ⬅️ الهاشتاق الإنكليزي ⬅️ التخيير بالأزرار
+async function determineSubjectStrictly(caption, senderBatch = '', senderYear = '', isAdmin = false) {
   const tags = extractTags(caption);
-  const normTags = tags.map(normalizeArabic);
-  const fullTextNorm = normalizeArabic(caption);
   const subjects = await getSubjectsData();
 
-  let matchedRows = [];
-  let subjectTag = '';
+  // تصفية المواد بحسب صلاحية العضو
+  let candidatePool = subjects;
+  if (!isAdmin && (senderBatch || senderYear)) {
+    candidatePool = subjects.filter(
+      (s) => (senderBatch && s.batch === senderBatch) || (senderYear && s.normYear === senderYear)
+    );
+  }
 
-  // مطابقة الهاشتاقات المتعددة وفصل الأرقام بمرونة
+  // 1. فحص الهاشتاق العربي أولاً
+  const arabicMatches = [];
   for (const tag of tags) {
     const norm = normalizeArabic(tag);
     const compactNorm = norm.replace(/\s+/g, '');
 
-    const matches = subjects.filter((s) => {
-      const aliases = s.hashtag.split(/[،,]/).map((a) => normalizeArabic(a));
-      return aliases.some((a) => a === norm || a.replace(/\s+/g, '') === compactNorm) ||
-             s.folderName.toLowerCase() === tag.toLowerCase() ||
-             s.folderName.replace(/\s+/g, '').toLowerCase() === tag.replace(/\s+/g, '').toLowerCase();
-    });
-
-    if (matches.length > 0) {
-      matchedRows = matches;
-      subjectTag = tag;
-      break;
-    }
-  }
-
-  if (matchedRows.length === 0) {
-    for (const sub of subjects) {
+    for (const sub of candidatePool) {
       const aliases = sub.hashtag.split(/[،,]/).map((a) => normalizeArabic(a));
-      if (aliases.some((a) => fullTextNorm.includes(a) || fullTextNorm.replace(/\s+/g, '').includes(a.replace(/\s+/g, '')))) {
-        matchedRows = [sub];
-        subjectTag = sub.hashtag;
-        break;
+      if (aliases.some((a) => a === norm || a.replace(/\s+/g, '') === compactNorm)) {
+        if (!arabicMatches.includes(sub)) arabicMatches.push(sub);
       }
     }
   }
 
-  if (matchedRows.length === 0) {
-    throw new Error('لم يتم التعرف على اسم المادة في الرسالة.');
+  if (arabicMatches.length === 1) {
+    return { status: 'EXACT', subject: arabicMatches[0] };
+  } else if (arabicMatches.length > 1) {
+    // هاشتاق عربي مشترك (مثل جراحة 3 لحالها)
+    return { status: 'AMBIGUOUS', candidates: arabicMatches };
   }
 
-  if (!isAdmin && (senderBatch || senderYear)) {
-    const matchWithUser = matchedRows.find(
-      (r) => (senderBatch && r.batch === senderBatch) || (senderYear && r.normYear === senderYear)
-    );
-    if (!matchWithUser) {
-      throw new Error(`صلاحياتك محصورة بمواد دفعتك فقط.`);
+  // 2. فحص الهاشتاق الإنكليزي ثانياً
+  const englishMatches = [];
+  for (const tag of tags) {
+    const cleanTag = tag.toLowerCase().replace(/_/g, ' ').trim();
+    const compactTag = cleanTag.replace(/\s+/g, '');
+
+    for (const sub of candidatePool) {
+      const fName = sub.folderName.toLowerCase().replace(/_/g, ' ').trim();
+      const compactFName = fName.replace(/\s+/g, '');
+
+      if (fName.includes(cleanTag) || compactFName.includes(compactTag) || cleanTag.includes(compactFName)) {
+        if (!englishMatches.includes(sub)) englishMatches.push(sub);
+      }
     }
-    matchedRows = [matchWithUser];
   }
 
-  const selectedSubject = matchedRows[0];
+  if (englishMatches.length === 1) {
+    return { status: 'EXACT', subject: englishMatches[0] };
+  } else if (englishMatches.length > 1) {
+    return { status: 'AMBIGUOUS', candidates: englishMatches };
+  }
+
+  // 3. لم يتم التعرف نهائياً ⬅️ التخيير بالأزرار
+  return { status: 'NONE', candidates: candidatePool };
+}
+
+function processFolderAndFileNameForSubject(selectedSubject, caption, originalFileName) {
+  const normTags = extractTags(caption).map(normalizeArabic);
+  const fullTextNorm = normalizeArabic(caption);
   const { folderName, year, semester, batch } = selectedSubject;
 
   const pinInfo = parsePinLine(caption, selectedSubject.theory);
@@ -557,7 +566,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     typeFolders = ['دورات'];
     if (pinInfo && pinInfo.doctorName) chosenSection = pinInfo.doctorName;
     if (!chosenSection) {
-      for (const tag of tags) {
+      for (const tag of extractTags(caption)) {
         const found = selectedSubject.courses.find((sec) => normalizeArabic(sec) === normalizeArabic(tag));
         if (found) { chosenSection = found; break; }
       }
@@ -570,7 +579,7 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     typeFolders = ['اكسترا'];
     if (pinInfo && pinInfo.doctorName) chosenSection = pinInfo.doctorName;
     if (!chosenSection) {
-      for (const tag of tags) {
+      for (const tag of extractTags(caption)) {
         const found = selectedSubject.extra.find((sec) => normalizeArabic(sec) === normalizeArabic(tag));
         if (found) { chosenSection = found; break; }
       }
@@ -600,7 +609,6 @@ async function determineFolderAndFileName(caption, originalFileName, senderBatch
     }
   }
 
-  // إضافة د. إذا لم تكن موجودة وكان طبيباً
   if (chosenSection && !chosenSection.startsWith('د.') && !chosenSection.startsWith('د ') && !chosenSection.startsWith('أ.د.')) {
     const isTopicOnly = ['الجراثيم العام', 'الفيروسات العام', 'الجراثيم الخاص', 'الفيروسات الخاص', 'البولية', 'الهضمية', 'الدموية', 'الصدرية', 'النفسية', 'الغدية', 'القلبية', 'الرثوية', 'العصبية', 'منهجية البحث', 'الوبائيات', 'الإحصاء الطبي'].some(t => normalizeArabic(t) === normalizeArabic(chosenSection));
     if (!isTopicOnly) {
@@ -720,7 +728,7 @@ function getFileActionButtons(driveFileId, subjectIdx) {
   ]);
 }
 
-// دالة تنفيذ الرفع مع إعادة المحاولة التلقائية (Auto-Retry) لمنع رسائل التعذر
+// دالة تنفيذ الرفع مع إعادة المحاولة التلقائية (Auto-Retry)
 async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year, subjectIdx }) {
   await ctx.reply(`جاري حفظ الملف وأرشفته: ${escapeHtml(fileName)}...`, { parse_mode: 'HTML' });
 
@@ -805,12 +813,12 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year,
             ...getFileActionButtons(driveFileId, subjectIdx)
           }
         );
-        return; // نجاح كامل
+        return;
       } catch (err) {
         lastError = err;
         console.error(`محاولة الرفع رقم ${attempt} تعثرت:`, err?.message);
         if (attempt < 2) {
-          await new Promise((r) => setTimeout(r, 2000)); // صبر ثانيتين وإعادة المحاولة بالخلفية
+          await new Promise((r) => setTimeout(r, 2000));
         }
       }
     }
@@ -876,7 +884,7 @@ bot.start(async (ctx) => {
 });
 
 // ==========================================
-// نظام التقارير المحدث /report
+// أمر /report لمراجعة المحاضرات المرفوعة
 // ==========================================
 bot.command('report', async (ctx) => {
   const userId = String(ctx.from.id);
@@ -889,13 +897,11 @@ bot.command('report', async (ctx) => {
   const subjects = await getSubjectsData();
 
   if (user.isAdmin) {
-    // خيارات الأدمن الشاملة
     const adminReportButtons = [
       [Markup.button.callback('📑 تقرير شامل: مواد الفصل الأول', 'rep_all:الفصل الأول')],
       [Markup.button.callback('📑 تقرير شامل: مواد الفصل الثاني', 'rep_all:الفصل الثاني')]
     ];
 
-    // أزرار لاختيار مادة فردية
     for (let i = 0; i < subjects.length; i += 2) {
       const row = [Markup.button.callback(subjects[i].hashtag.split(/[،,]/)[0].trim(), `rep_one:${i}`)];
       if (subjects[i + 1]) {
@@ -910,7 +916,6 @@ bot.command('report', async (ctx) => {
     );
   }
 
-  // المشرف العادي: يرى مواد سنته فقط
   const mySubs = subjects.filter((s) => s.normYear === user.userYear || s.batch === user.userBatch);
 
   if (mySubs.length === 0) {
@@ -934,7 +939,6 @@ bot.command('report', async (ctx) => {
   );
 });
 
-// إرسال تقرير شامل فصلي كرسائل متتالية للأدمن
 bot.action(/^rep_all:(.+)$/, async (ctx) => {
   const semester = ctx.match[1];
   await ctx.answerCbQuery('جاري تحضير التقارير...');
@@ -951,7 +955,7 @@ bot.action(/^rep_all:(.+)$/, async (ctx) => {
     try {
       const repMsg = await generateSubjectReportMessage(sub);
       await ctx.reply(repMsg, { parse_mode: 'HTML' });
-      await new Promise((r) => setTimeout(r, 600)); // فاصل زمني لتفادي حظر التيليغرام
+      await new Promise((r) => setTimeout(r, 600));
     } catch (e) {
       console.error(`خطأ تقرير مادة ${sub.hashtag}:`, e?.message);
     }
@@ -970,7 +974,6 @@ bot.action(/^rep_one:(\d+)$/, async (ctx) => {
   await ctx.reply(repMsg, { parse_mode: 'HTML' });
 });
 
-// دالة إنشاء تقرير المادة منسق تماماً كبوست RBCs وبأرقام المحاضرات الحقيقية
 async function generateSubjectReportMessage(sub) {
   const batchesMap = await getBatchesDriveMap();
   const rootParentId = batchesMap.get(String(sub.batch)) || 
@@ -980,7 +983,6 @@ async function generateSubjectReportMessage(sub) {
   const basePath = buildTargetFolderPath(sub, 'نظري', '');
   const folderId = await getOrCreateFolderPath(basePath, rootParentId);
 
-  // جلب المجلدات الفرعية (الدكاترة) والملفات المباشرة
   const itemsRes = await drive.files.list({
     q: `'${folderId}' in parents and trashed = false`,
     fields: 'files(id, name, mimeType)',
@@ -997,7 +999,6 @@ async function generateSubjectReportMessage(sub) {
 
   let totalLectures = 0;
 
-  // جلب محاضرات كل دكتور مع رقمها الحقيقي
   for (const docFolder of doctorFolders) {
     const docFilesRes = await drive.files.list({
       q: `'${docFolder.id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
@@ -1036,9 +1037,9 @@ async function generateSubjectReportMessage(sub) {
 }
 
 // ==========================================
-// أمر /add_section للأدمن لإضافة دكتور/قسم بالشيت
+// لوحة إدارة الأقسام والدكاترة للأدمن /manage_sections
 // ==========================================
-bot.command('add_section', async (ctx) => {
+bot.command(['manage_sections', 'add_section'], async (ctx) => {
   const userId = String(ctx.from.id);
   const user = await isUserAllowed(userId);
 
@@ -1050,40 +1051,177 @@ bot.command('add_section', async (ctx) => {
   const subButtons = [];
 
   for (let i = 0; i < subjects.length; i += 2) {
-    const row = [Markup.button.callback(subjects[i].hashtag.split(/[،,]/)[0].trim(), `addsec_sub:${i}`)];
+    const row = [Markup.button.callback(subjects[i].hashtag.split(/[،,]/)[0].trim(), `mngsec_sub:${i}`)];
     if (subjects[i + 1]) {
-      row.push(Markup.button.callback(subjects[i + 1].hashtag.split(/[،,]/)[0].trim(), `addsec_sub:${i + 1}`));
+      row.push(Markup.button.callback(subjects[i + 1].hashtag.split(/[،,]/)[0].trim(), `mngsec_sub:${i + 1}`));
     }
     subButtons.push(row);
   }
 
-  subButtons.push([Markup.button.callback('❌ إلغاء', 'addsec_cancel')]);
+  subButtons.push([Markup.button.callback('❌ إغلاق', 'mngsec_cancel')]);
 
   await ctx.reply(
-    '⚙️ <b>إدارة الأقسام والدكاترة:</b>\nاختر المادة التي ترغب بإضافة دكتور أو قسم إليها:',
+    '⚙️ <b>لوحة إدارة الدكاترة والأقسام:</b>\nاختر المادة المراد تعديل أقسامها أو دكاترتها:',
     { parse_mode: 'HTML', ...Markup.inlineKeyboard(subButtons) }
   );
 });
 
-bot.action(/^addsec_sub:(\d+)$/, async (ctx) => {
+bot.action(/^mngsec_sub:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const subIdx = Number(ctx.match[1]);
   const sub = (await getSubjectsData())[subIdx];
 
   const catButtons = [
-    [Markup.button.callback('📖 نظري', `addsec_cat:${subIdx}:theory`), Markup.button.callback('🔬 عملي', `addsec_cat:${subIdx}:practical`)],
-    [Markup.button.callback('🏥 ستاج', `addsec_cat:${subIdx}:stage`), Markup.button.callback('📝 دورات', `addsec_cat:${subIdx}:courses`)],
-    [Markup.button.callback('✨ اكسترا', `addsec_cat:${subIdx}:extra`)],
-    [Markup.button.callback('❌ إلغاء', 'addsec_cancel')]
+    [Markup.button.callback('📖 نظري', `mngsec_cat:${subIdx}:theory`), Markup.button.callback('🔬 عملي', `mngsec_cat:${subIdx}:practical`)],
+    [Markup.button.callback('🏥 ستاج', `mngsec_cat:${subIdx}:stage`), Markup.button.callback('📝 دورات', `mngsec_cat:${subIdx}:courses`)],
+    [Markup.button.callback('✨ اكسترا', `mngsec_cat:${subIdx}:extra`)],
+    [Markup.button.callback('🔙 رجوع للمواد', 'mngsec_back_subs')]
   ];
 
   await ctx.editMessageText(
-    `<b>مادة ${escapeHtml(sub.hashtag)}</b>\nاختر الخانة المراد إضافة الدكتور أو القسم إليها:`,
+    `<b>مادة ${escapeHtml(sub.hashtag)}</b>\nاختر القسم المراد استعراض دكاترته أو تعديله:`,
     { parse_mode: 'HTML', ...Markup.inlineKeyboard(catButtons) }
   );
 });
 
-bot.action(/^addsec_cat:(\d+):(.+)$/, async (ctx) => {
+bot.action('mngsec_back_subs', async (ctx) => {
+  await ctx.answerCbQuery();
+  const subjects = await getSubjectsData();
+  const subButtons = [];
+
+  for (let i = 0; i < subjects.length; i += 2) {
+    const row = [Markup.button.callback(subjects[i].hashtag.split(/[،,]/)[0].trim(), `mngsec_sub:${i}`)];
+    if (subjects[i + 1]) {
+      row.push(Markup.button.callback(subjects[i + 1].hashtag.split(/[،,]/)[0].trim(), `mngsec_sub:${i + 1}`));
+    }
+    subButtons.push(row);
+  }
+
+  subButtons.push([Markup.button.callback('❌ إغلاق', 'mngsec_cancel')]);
+
+  await ctx.editMessageText(
+    '⚙️ <b>لوحة إدارة الدكاترة والأقسام:</b>\nاختر المادة:',
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard(subButtons) }
+  );
+});
+
+// عرض قائمة الدكاترة الحالية مع خيار إضافة دكتور جديد
+bot.action(/^mngsec_cat:(\d+):(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const subIdx = Number(ctx.match[1]);
+  const colCategory = ctx.match[2];
+  const sub = (await getSubjectsData())[subIdx];
+
+  let currentList = [];
+  if (colCategory === 'theory') currentList = sub.theory;
+  else if (colCategory === 'courses') currentList = sub.courses;
+  else if (colCategory === 'extra') currentList = sub.extra;
+
+  const docButtons = [];
+
+  // إظهار أسماء الدكاترة بأيقونة محترمة
+  for (let i = 0; i < currentList.length; i++) {
+    const docName = currentList[i];
+    docButtons.push([Markup.button.callback(`👨‍⚕️ ${docName}`, `mngsec_ask_del:${subIdx}:${colCategory}:${i}`)]);
+  }
+
+  docButtons.push([Markup.button.callback('➕ إضافة دكتور / قسم جديد', `mngsec_add:${subIdx}:${colCategory}`)]);
+  docButtons.push([Markup.button.callback('🔙 رجوع للأقسام', `mngsec_sub:${subIdx}`)]);
+
+  const catNames = { theory: 'نظري', practical: 'عملي', stage: 'ستاج', courses: 'دورات', extra: 'اكسترا' };
+
+  await ctx.editMessageText(
+    `⚙️ <b>إدارة [${escapeHtml(sub.hashtag)} &gt; ${catNames[colCategory] || colCategory}]:</b>\n` +
+    `القائمة الحالية المسجلة بالشيت:\n(اضغط على اسم الدكتور لتعديله أو استبعاده)`,
+    { parse_mode: 'HTML', ...Markup.inlineKeyboard(docButtons) }
+  );
+});
+
+// نافذة التأكيد المحترمة لإزالة الدكتور
+bot.action(/^mngsec_ask_del:(\d+):(.+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const subIdx = Number(ctx.match[1]);
+  const colCategory = ctx.match[2];
+  const docIdx = Number(ctx.match[3]);
+
+  const sub = (await getSubjectsData())[subIdx];
+  let currentList = [];
+  if (colCategory === 'theory') currentList = sub.theory;
+  else if (colCategory === 'courses') currentList = sub.courses;
+  else if (colCategory === 'extra') currentList = sub.extra;
+
+  const targetDoc = currentList[docIdx];
+
+  const confirmButtons = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ نعم، إزالة من القسم', `mngsec_do_del:${subIdx}:${colCategory}:${docIdx}`)],
+    [Markup.button.callback('🔙 تراجع', `mngsec_cat:${subIdx}:${colCategory}`)]
+  ]);
+
+  await ctx.editMessageText(
+    `<b>إدارة القسم:</b>\nهل ترغب بإزالة <b>${escapeHtml(targetDoc)}</b> من قائمة هذا القسم؟`,
+    { parse_mode: 'HTML', ...confirmButtons }
+  );
+});
+
+// تنفيذ إزالة الدكتور من الشيت
+bot.action(/^mngsec_do_del:(\d+):(.+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery('جاري الإزالة...');
+  const subIdx = Number(ctx.match[1]);
+  const colCategory = ctx.match[2];
+  const docIdx = Number(ctx.match[3]);
+
+  const sub = (await getSubjectsData())[subIdx];
+  let currentList = [];
+  if (colCategory === 'theory') currentList = sub.theory;
+  else if (colCategory === 'courses') currentList = sub.courses;
+  else if (colCategory === 'extra') currentList = sub.extra;
+
+  const removedDoc = currentList[docIdx];
+  currentList.splice(docIdx, 1);
+  const updatedValue = currentList.join('، ');
+
+  try {
+    await resolveSheetTitles();
+    const escapedTitle = resolvedSubjectsSheetTitle.replace(/'/g, "''");
+
+    const headerRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `'${escapedTitle}'!1:1`
+    });
+
+    const headers = (headerRes.data.values?.[0] || []).map((h) => String(h || '').trim().toLowerCase());
+    const colIndex = headers.findIndex((h) => h.startsWith(colCategory));
+
+    if (colIndex !== -1) {
+      const colLetter = String.fromCharCode(65 + colIndex);
+      const cellRange = `'${escapedTitle}'!${colLetter}${sub.rowIndex}`;
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        range: cellRange,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [[updatedValue]] }
+      });
+
+      subjectsCacheAt = 0;
+      await getSubjectsData();
+
+      await ctx.editMessageText(
+        `✅ تم استبعاد <b>${escapeHtml(removedDoc)}</b> من القسم وتحديث الشيت بنجاح.`,
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([[Markup.button.callback('🔙 العودة لقائمة القسم', `mngsec_cat:${subIdx}:${colCategory}`)]])
+        }
+      );
+    }
+  } catch (err) {
+    console.error('خطأ إزالة الدكتور:', err?.message);
+    await ctx.editMessageText('حدث خطأ أثناء تعديل Google Sheet.');
+  }
+});
+
+// طلب اسم الدكتور الجديد
+bot.action(/^mngsec_add:(\d+):(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const subIdx = Number(ctx.match[1]);
   const colCategory = ctx.match[2];
@@ -1103,9 +1241,9 @@ bot.action(/^addsec_cat:(\d+):(.+)$/, async (ctx) => {
   );
 });
 
-bot.action('addsec_cancel', async (ctx) => {
+bot.action('mngsec_cancel', async (ctx) => {
   await ctx.answerCbQuery('تم الإلغاء');
-  await ctx.editMessageText('تم إلغاء عملية إضافة القسم.');
+  await ctx.editMessageText('تم إغلاق لوحة إدارة الأقسام.');
 });
 
 // استقبال النصوص للأزرار وإدخال البيانات
@@ -1135,7 +1273,6 @@ bot.on('text', async (ctx, next) => {
         return ctx.reply('تعذر العثور على العمود المناسب في الشيت.');
       }
 
-      // حساب حرف العمود
       const colLetter = String.fromCharCode(65 + colIdx);
       const cellRange = `'${escapedTitle}'!${colLetter}${addSecState.sub.rowIndex}`;
 
@@ -1154,12 +1291,15 @@ bot.on('text', async (ctx, next) => {
         requestBody: { values: [[newVal]] }
       });
 
-      subjectsCacheAt = 0; // تحديث الكاش فوراً
+      subjectsCacheAt = 0;
       await getSubjectsData();
 
       return ctx.reply(
         `✅ <b>تمت الإضافة بنجاح!</b>\nتمت إضافة <b>${escapeHtml(text)}</b> إلى خانة ${addSecState.colCategory} بمادة <b>${escapeHtml(addSecState.sub.hashtag)}</b>.`,
-        { parse_mode: 'HTML', ...MAIN_MENU_KEYBOARD }
+        {
+          parse_mode: 'HTML',
+          ...Markup.inlineKeyboard([[Markup.button.callback('🔙 العودة لإدارة القسم', `mngsec_cat:${addSecState.subIdx}:${addSecState.colCategory}`)]])
+        }
       );
     } catch (err) {
       console.error('خطأ تعديل الشيت:', err?.message);
@@ -1425,6 +1565,7 @@ bot.on('text', async (ctx, next) => {
       } else {
         browseState.set(userId, {
           step: 'TYPES',
+          batch: state.batch,
           year: state.year,
           subIdx: state.subIdx,
           sub: state.sub
@@ -1700,7 +1841,7 @@ async function downloadAndSendFile(ctx, fileId) {
 }
 
 // ==========================================
-// استقبال الملفات من أعضاء الفريق
+// استقبال الملفات وتطبيق سلّم الأولويات الصارم
 // ==========================================
 bot.on(['document', 'photo'], async (ctx) => {
   if (shuttingDown) return;
@@ -1719,24 +1860,79 @@ bot.on(['document', 'photo'], async (ctx) => {
   const fileInfo = getTelegramFileInfo(ctx.message);
   if (!fileInfo) return;
 
-  let processPlan;
-  try {
-    processPlan = await determineFolderAndFileName(
-      ctx.message.caption?.trim(),
-      fileInfo.fileName,
-      allowedUser.userBatch,
-      allowedUser.userYear,
-      allowedUser.isAdmin
-    );
-  } catch (err) {
-    return ctx.reply(`تنبيه: ${err.message}`);
+  // فحص المادة بسلّم الأولويات الصارم: عربي ⬅️ إنكليزي ⬅️ أزرار
+  const resolution = await determineSubjectStrictly(
+    ctx.message.caption?.trim(),
+    allowedUser.userBatch,
+    allowedUser.userYear,
+    allowedUser.isAdmin
+  );
+
+  const sessionId = `upl_${Date.now()}_${senderId}`;
+
+  // إذا لم يتم تحديد المادة بدقة أو كان الهاشتاق محيّراً ⬅️ التخيير بالأزرار الشفافة
+  if (resolution.status !== 'EXACT') {
+    userSessions.set(sessionId, {
+      fileInfo,
+      caption: ctx.message.caption?.trim(),
+      senderBatch: allowedUser.userBatch,
+      senderYear: allowedUser.userYear,
+      isAdmin: allowedUser.isAdmin,
+      expiresAt: Date.now() + 15 * 60 * 1000
+    });
+
+    const candidates = resolution.candidates || [];
+    const choiceButtons = [];
+
+    for (let i = 0; i < candidates.length; i += 2) {
+      const sub1 = candidates[i];
+      const idx1 = subjectsCache.indexOf(sub1);
+      const row = [Markup.button.callback(sub1.hashtag.split(/[،,]/)[0].trim(), `pick_sub:${sessionId}:${idx1}`)];
+
+      if (candidates[i + 1]) {
+        const sub2 = candidates[i + 1];
+        const idx2 = subjectsCache.indexOf(sub2);
+        row.push(Markup.button.callback(sub2.hashtag.split(/[،,]/)[0].trim(), `pick_sub:${sessionId}:${idx2}`));
+      }
+      choiceButtons.push(row);
+    }
+
+    choiceButtons.push([Markup.button.callback('❌ إلغاء', `btn_cancel:${sessionId}`)]);
+
+    const promptText = resolution.status === 'AMBIGUOUS'
+      ? `📚 <b>الهاشتاق يشمل أكثر من مادة:</b>\nتفضل باختيار المادة التابع لها هذا الملف:`
+      : `⚠️ <b>لم يتم تحديد المادة تلقائياً:</b>\nاختر مادة الملف للمتابعة:`;
+
+    return ctx.reply(promptText, { parse_mode: 'HTML', ...Markup.inlineKeyboard(choiceButtons) });
   }
 
-  const { folderPath, fileName, selectedSubject, batch, year, isFullyDetermined } = processPlan;
+  // تم تحديد المادة بدقة
+  await processAndUploadWithSubject(ctx, resolution.subject, fileInfo, ctx.message.caption?.trim(), sessionId);
+});
+
+// التعامل مع اختيار المادة من التخيير
+bot.action(/^pick_sub:(.+):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const sessionId = ctx.match[1];
+  const subIdx = Number(ctx.match[2]);
+
+  const session = userSessions.get(sessionId);
+  if (!session) return ctx.editMessageText('انتهت صلاحية الجلسة.');
+
+  const selectedSubject = subjectsCache[subIdx];
+  userSessions.delete(sessionId);
+
+  await ctx.editMessageText(`✅ تم اختيار: <b>${escapeHtml(selectedSubject.folderName)}</b>`, { parse_mode: 'HTML' });
+  await processAndUploadWithSubject(ctx, selectedSubject, session.fileInfo, session.caption, sessionId);
+});
+
+// إكمال المعالجة والرفع للمادة المحددة
+async function processAndUploadWithSubject(ctx, selectedSubject, fileInfo, caption, sessionId) {
+  const processPlan = processFolderAndFileNameForSubject(selectedSubject, caption, fileInfo.fileName);
+  const { folderPath, fileName, batch, year, isFullyDetermined } = processPlan;
   const subIdx = subjectsCache.indexOf(selectedSubject);
 
   if (!isFullyDetermined) {
-    const sessionId = `upl_${Date.now()}_${senderId}`;
     userSessions.set(sessionId, {
       fileInfo,
       fileName,
@@ -1763,7 +1959,7 @@ bot.on(['document', 'photo'], async (ctx) => {
   }
 
   await executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year, subjectIdx: subIdx });
-});
+}
 
 bot.action(/^btn_type:(.+):(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
@@ -2014,7 +2210,8 @@ bot.action(/^mov_f:(.+):(\d+):(.+):(.+)$/, async (ctx) => {
     chosenDoc = list[Number(docIdx)] || '';
 
     if (chosenDoc && !chosenDoc.startsWith('د.') && !chosenDoc.startsWith('د ') && !chosenDoc.startsWith('أ.د.')) {
-      chosenDoc = `د. ${chosenDoc}`;
+      const isTopicOnly = ['الجراثيم العام', 'الفيروسات العام', 'الجراثيم الخاص', 'الفيروسات الخاص', 'البولية', 'الهضمية', 'الدموية', 'الصدرية', 'النفسية', 'الغدية', 'القلبية', 'الرثوية', 'العصبية', 'منهجية البحث', 'الوبائيات', 'الإحصاء الطبي'].some(t => normalizeArabic(t) === normalizeArabic(chosenDoc));
+      if (!isTopicOnly) chosenDoc = `د. ${chosenDoc}`;
     }
   }
 
