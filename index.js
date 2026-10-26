@@ -89,6 +89,7 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
+// تطبيع ذكي للنصوص يفصل الأرقام عن الحروف
 function normalizeArabic(str) {
   return String(str || '')
     .trim()
@@ -174,6 +175,7 @@ function parseArabicLectureNumber(text) {
   return '';
 }
 
+// كشف الألقاب العلمية أ.د. ود.
 function parsePinLine(caption, knownDoctors = []) {
   if (!caption) return null;
   const lines = caption.split('\n');
@@ -475,6 +477,7 @@ function extractTags(caption) {
   return matches.map((t) => t.replace(/^#/, '').trim());
 }
 
+// السلّم الصارم لتحديد المادة: الهاشتاق العربي ⬅️ الهاشتاق الإنكليزي ⬅️ التخيير بالأزرار
 async function determineSubjectStrictly(caption, senderBatch = '', senderYear = '', isAdmin = false) {
   const tags = extractTags(caption);
   const subjects = await getSubjectsData();
@@ -528,10 +531,11 @@ async function determineSubjectStrictly(caption, senderBatch = '', senderYear = 
     return { status: 'AMBIGUOUS', candidates: englishMatches };
   }
 
-  // 3. لم يتم التعرف ⬅️ التخيير بالأزرار
+  // 3. لم يتم التعرف ⬅️ التخيير بالأزرار الشفافة
   return { status: 'NONE', candidates: candidatePool };
 }
 
+// معالجة نوع الملف وقاعدة (إذا احتار خيّره)
 function processFolderAndFileNameForSubject(selectedSubject, caption, originalFileName) {
   const normTags = extractTags(caption).map(normalizeArabic);
   const fullTextNorm = normalizeArabic(caption);
@@ -549,15 +553,37 @@ function processFolderAndFileNameForSubject(selectedSubject, caption, originalFi
     }
   }
 
-  const isCourses = fullTextNorm.includes('دورات') || fullTextNorm.includes('دوره') || normTags.some((t) => t.includes('دورات'));
-  const isStage = !isCourses && normTags.some((t) => t.includes('ستاج') || t.includes('اوسكي'));
-  const isPractical = !isCourses && normTags.some((t) => t.includes('عملي'));
-  const isExtra = !isCourses && normTags.some((t) => t.includes('اكسترا'));
+  // فحص المصطلحات الطبية الفسيولوجية (الدورة القلبية، الدموية، الطمثية...) لمنع الخلط
+  const isMedicalCycle = fullTextNorm.includes('الدوره القلبيه') ||
+                         fullTextNorm.includes('الدوره الدمويه') ||
+                         fullTextNorm.includes('الدوره الطمثيه') ||
+                         fullTextNorm.includes('الدوره الشهريه') ||
+                         fullTextNorm.includes('دوره كريبس') ||
+                         fullTextNorm.includes('دوره الخليه');
+
+  const isFaqaratDawrat = fullTextNorm.includes('فقرات دورات');
+
+  // الدورات الامتحانية المؤكدة
+  const isExplicitCourses = !isMedicalCycle && (
+    normTags.some((t) => t === 'دورات' || t === 'اسئله دورات' || t.startsWith('دوره 20') || t.startsWith('دوره_20')) ||
+    fullTextNorm.includes('اسئله دورات') ||
+    fullTextNorm.includes('ارشيف دورات') ||
+    fullTextNorm.includes('دورات سابقه') ||
+    fullTextNorm.includes('دورات قديمه') ||
+    fullTextNorm.includes('دوره نظاميه') ||
+    fullTextNorm.includes('دوره تكميليه') ||
+    fullTextNorm.includes('دوره حمله') ||
+    (fullTextNorm.includes('دورات د') || fullTextNorm.includes('دورات الدكتور'))
+  );
+
+  const isStage = normTags.some((t) => t.includes('ستاج') || t.includes('اوسكي'));
+  const isPractical = normTags.some((t) => t.includes('عملي'));
+  const isExtra = normTags.some((t) => t.includes('اكسترا')) || isFaqaratDawrat;
 
   let typeFolders = [];
   let chosenSection = '';
 
-  if (isCourses) {
+  if (isExplicitCourses) {
     typeFolders = ['دورات'];
     if (pinInfo && pinInfo.doctorName) chosenSection = pinInfo.doctorName;
     if (!chosenSection) {
@@ -582,6 +608,7 @@ function processFolderAndFileNameForSubject(selectedSubject, caption, originalFi
   } else {
     typeFolders = ['نظري'];
 
+    // مطابقة اسم الدكتور المسجل بالشيت فقط
     if (pinInfo && pinInfo.doctorName) {
       const normPinDoc = normalizeArabic(pinInfo.doctorName);
       const matchedDoctor = selectedSubject.theory.find((doc) => {
@@ -623,6 +650,7 @@ function processFolderAndFileNameForSubject(selectedSubject, caption, originalFi
   finalPath.push(...typeFolders);
   if (chosenSection) finalPath.push(chosenSection);
 
+  // إذا احتار الكود بالقسم أو الدكتور ⬅️ يخيّر العضو بالأزرار
   const needsSelection = (typeFolders.includes('نظري') && selectedSubject.theory.length > 0 && !chosenSection);
 
   return {
@@ -631,13 +659,14 @@ function processFolderAndFileNameForSubject(selectedSubject, caption, originalFi
     selectedSubject,
     batch,
     year,
-    isFullyDetermined: !needsSelection && Boolean(isStage || isPractical || isCourses || isExtra || chosenSection || selectedSubject.theory.length === 0)
+    isFullyDetermined: !needsSelection && Boolean(isStage || isPractical || isExplicitCourses || isExtra || chosenSection || selectedSubject.theory.length === 0)
   };
 }
 
 async function getOrCreateFolderPath(folderNames, rootParentId = GOOGLE_DRIVE_FOLDER_ID) {
   let parentId = rootParentId;
 
+  // تفكيك أي سلاش بالمسار تلقائياً
   const flattenedNames = [];
   for (const name of folderNames) {
     if (String(name).includes('/')) {
@@ -721,7 +750,7 @@ function getFileActionButtons(driveFileId, subjectIdx) {
   ]);
 }
 
-// دالة تنفيذ الرفع مع تشفير الروابط العربية وإعادة المحاولة التلقائية
+// دالة تنفيذ الرفع مع تشفير الروابط وإعادة المحاولة التلقائية (Auto-Retry)
 async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year, subjectIdx }) {
   await ctx.reply(`جاري حفظ الملف وأرشفته: ${escapeHtml(fileName)}...`, { parse_mode: 'HTML' });
 
@@ -737,7 +766,7 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year,
 
         const fileLink = await ctx.telegram.getFileLink(fileInfo.fileId);
         
-        // تشفير الرابط لحل مشكلة الحروف العربية والمسافات (ERR_UNESCAPED_CHARACTERS)
+        // تشفير الرابط بأمان لحل مشكلة الحروف العربية والمسافات
         const safeDownloadUrl = encodeURI(decodeURI(fileLink.href));
 
         const response = await axios.get(safeDownloadUrl, {
@@ -1102,6 +1131,7 @@ bot.action('mngsec_back_subs', async (ctx) => {
   );
 });
 
+// عرض قائمة الدكاترة الحالية بأسماء محترمة
 bot.action(/^mngsec_cat:(\d+):(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const subIdx = Number(ctx.match[1]);
@@ -1132,6 +1162,7 @@ bot.action(/^mngsec_cat:(\d+):(.+)$/, async (ctx) => {
   );
 });
 
+// نافذة التأكيد المحترمة لإزالة الدكتور
 bot.action(/^mngsec_ask_del:(\d+):(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const subIdx = Number(ctx.match[1]);
@@ -1157,6 +1188,7 @@ bot.action(/^mngsec_ask_del:(\d+):(.+):(\d+)$/, async (ctx) => {
   );
 });
 
+// تنفيذ إزالة الدكتور من الشيت
 bot.action(/^mngsec_do_del:(\d+):(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery('جاري الإزالة...');
   const subIdx = Number(ctx.match[1]);
@@ -1213,6 +1245,7 @@ bot.action(/^mngsec_do_del:(\d+):(.+):(\d+)$/, async (ctx) => {
   }
 });
 
+// طلب اسم الدكتور الجديد
 bot.action(/^mngsec_add:(\d+):(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const subIdx = Number(ctx.match[1]);
@@ -1860,6 +1893,7 @@ bot.on(['document', 'photo'], async (ctx) => {
 
   const sessionId = `upl_${Date.now()}_${senderId}`;
 
+  // إذا لم يتم تحديد المادة أو كان الهاشتاق محيّراً ⬅️ التخيير بالأزرار الشفافة
   if (resolution.status !== 'EXACT') {
     userSessions.set(sessionId, {
       fileInfo,
