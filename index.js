@@ -186,7 +186,7 @@ function parseArabicLectureNumber(text) {
   return '';
 }
 
-// كشف الألقاب العلمية أ.د. ود.
+// دالة فحص وتحديد أجزاء سطر الدبوس بدقة متناهية
 function parsePinLine(caption, knownDoctors = []) {
   if (!caption) return null;
   const lines = caption.split('\n');
@@ -207,51 +207,83 @@ function parsePinLine(caption, knownDoctors = []) {
 
   const lecNum = parseArabicLectureNumber(lecturePart);
 
-  function isDoctor(str) {
+  // هل الجزء يبدأ صراحة بلقب طبيب؟
+  function hasDoctorPrefix(str) {
     if (!str) return false;
     const norm = normalizeArabic(str);
     const normNoDots = norm.replace(/[.]/g, '');
-
-    if (
-      norm.startsWith('د ') ||
-      norm.startsWith('د.') ||
-      norm.startsWith('ا.د') ||
-      norm.startsWith('أ.د') ||
-      normNoDots.startsWith('اد ') ||
-      normNoDots.startsWith('ا د ') ||
-      norm.startsWith('الدكتور') ||
-      norm.startsWith('الدكتوره') ||
-      norm.startsWith('استاذ دكتور') ||
-      norm.startsWith('الاستاذ الدكتور') ||
+    return (
+      norm.startsWith('د ') || norm.startsWith('د.') ||
+      norm.startsWith('ا.د') || norm.startsWith('أ.د') ||
+      normNoDots.startsWith('اد ') || normNoDots.startsWith('ا د ') ||
+      norm.startsWith('الدكتور') || norm.startsWith('الدكتوره') ||
+      norm.startsWith('استاذ دكتور') || norm.startsWith('الاستاذ الدكتور') ||
       norm.startsWith('بروفيسور')
-    ) {
-      return true;
-    }
+    );
+  }
 
-    return knownDoctors.some((doc) => {
-      const cleanDocNorm = normalizeArabic(doc)
-        .replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتورة|الاستاذ الدكتور|أستاذ دكتور)\s*/i, '')
-        .trim();
-      return cleanDocNorm.length > 2 && norm.includes(cleanDocNorm);
-    });
+  // هل الجزء يحتوي على كلمات تدل على عنوان المحاضرة/الإكسترا؟
+  function isLikelyTitle(str) {
+    if (!str) return false;
+    const norm = normalizeArabic(str);
+    return (
+      norm.includes('فقرات') || norm.includes('افكار') ||
+      norm.includes('ملحق') || norm.includes('نوطه') ||
+      norm.includes('اسئله') || norm.includes('تجميعات') ||
+      norm.includes('بيكسورايز') || norm.includes('سكيتشي') ||
+      norm.includes('مقدمه') || norm.includes('تشخيص') ||
+      norm.includes('اضافيه') || norm.includes('اضافات')
+    );
   }
 
   let titlePart = '';
   let doctorPart = '';
 
+  const p1DocPre = hasDoctorPrefix(p1);
+  const p2DocPre = hasDoctorPrefix(p2);
+  const p1TitleLike = isLikelyTitle(p1);
+  const p2TitleLike = isLikelyTitle(p2);
+
   if (parts.length === 2) {
-    if (isDoctor(p1)) doctorPart = p1;
+    if (p1DocPre) doctorPart = p1;
     else titlePart = p1;
   } else {
-    if (isDoctor(p1)) {
+    // عند وجود 3 أجزاء
+    if (p2DocPre && !p1DocPre) {
+      doctorPart = p2;
+      titlePart = p1;
+    } else if (p1DocPre && !p2DocPre) {
       doctorPart = p1;
       titlePart = p2;
-    } else if (isDoctor(p2)) {
-      doctorPart = p2;
+    } else if (p1TitleLike && !p2TitleLike) {
       titlePart = p1;
+      doctorPart = p2;
+    } else if (p2TitleLike && !p1TitleLike) {
+      titlePart = p2;
+      doctorPart = p1;
     } else {
-      titlePart = p1;
-      doctorPart = p2;
+      // مطابقة الاسم الصافي مع الدكاترة المسجلين بالشيت
+      const p1Exact = knownDoctors.some((doc) => {
+        const cleanDoc = normalizeArabic(doc).replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتوره)\s*/i, '').trim();
+        const p1Clean = normalizeArabic(p1).replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتوره)\s*/i, '').trim();
+        return cleanDoc && p1Clean && cleanDoc === p1Clean;
+      });
+      const p2Exact = knownDoctors.some((doc) => {
+        const cleanDoc = normalizeArabic(doc).replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتوره)\s*/i, '').trim();
+        const p2Clean = normalizeArabic(p2).replace(/^(ا\.?د\.?|أ\.?د\.?|د\.?|الدكتور|الدكتوره)\s*/i, '').trim();
+        return cleanDoc && p2Clean && cleanDoc === p2Clean;
+      });
+
+      if (p2Exact && !p1Exact) {
+        doctorPart = p2;
+        titlePart = p1;
+      } else if (p1Exact && !p2Exact) {
+        doctorPart = p1;
+        titlePart = p2;
+      } else {
+        titlePart = p1;
+        doctorPart = p2;
+      }
     }
   }
 
@@ -857,11 +889,13 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year,
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const batchesMap = await getBatchesDriveMap();
-        const targetRootId = batchesMap.get(String(batch)) ||
-                             batchesMap.get(normalizeArabic(year)) ||
+        const targetRootId = batchesMap.get(String(batch)) || 
+                             batchesMap.get(normalizeArabic(year)) || 
                              GOOGLE_DRIVE_FOLDER_ID;
 
         const fileLink = await ctx.telegram.getFileLink(fileInfo.fileId);
+        
+        // تشفير الرابط بأمان لحل مشكلة الحروف العربية والمسافات
         const safeDownloadUrl = encodeURI(decodeURI(fileLink.href));
 
         const response = await axios.get(safeDownloadUrl, {
@@ -911,10 +945,14 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year,
         const driveFileId = uploaded.data.id;
         const fileUrl = uploaded.data.webViewLink ? `\n🔗 <a href="${uploaded.data.webViewLink}">رابط الملف في الأرشيف</a>` : '';
 
-        userSessions.set(`file_info_${driveFileId}`, { ownerId: String(ctx.from.id), batch, year });
+        userSessions.set(`file_info_${driveFileId}`, {
+          ownerId: String(ctx.from.id),
+          batch,
+          year
+        });
 
-        const noteMsg = isUpdatedVersion
-          ? `\nℹ️ <i>ملاحظة: تم تحديث النسخة السابقة للملف بنجاح بدلاً من تكرارها.</i>`
+        const noteMsg = isUpdatedVersion 
+          ? `\nℹ️ <i>ملاحظة: تم تحديث النسخة السابقة للملف بنجاح بدلاً من تكرارها.</i>` 
           : '';
 
         await ctx.reply(
@@ -922,14 +960,21 @@ async function executeUpload({ ctx, fileInfo, folderPath, fileName, batch, year,
           `📄 <b>الملف:</b> ${escapeHtml(fileName)}\n` +
           `📂 <b>المسار:</b> ${escapeHtml(folderPath.join(' / '))}` +
           fileUrl,
-          { parse_mode: 'HTML', ...getFileActionButtons(driveFileId, subjectIdx) }
+          {
+            parse_mode: 'HTML',
+            ...getFileActionButtons(driveFileId, subjectIdx)
+          }
         );
         return;
       } catch (err) {
+        lastError = err;
         console.error(`محاولة الرفع رقم ${attempt} تعثرت:`, err?.message);
-        if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 2000));
+        }
       }
     }
+
     await ctx.reply('تعذر حفظ الملف حالياً، يرجى إعادة المحاولة.');
   });
 }
@@ -938,33 +983,43 @@ function buildTargetFolderPath(sub, type, sectionName) {
   const finalPath = [];
   if (sub.year) finalPath.push(sub.year);
   if (sub.semester) finalPath.push(sub.semester);
+
   if (sub.folderName.includes('/')) {
     finalPath.push(...sub.folderName.split('/').map((f) => f.trim()).filter(Boolean));
   } else {
     finalPath.push(sub.folderName);
   }
+
   if (type) finalPath.push(type);
   if (sectionName) finalPath.push(sectionName);
+
   return finalPath;
 }
 
 function generateTypeKeyboard(sub, backText) {
   const rows = [];
   const topRow = [];
+
   if (sub.hasTheory) topRow.push('📖 نظري');
   if (sub.hasPractical) topRow.push('🔬 عملي');
   else if (sub.hasStage) topRow.push('🏥 ستاج');
 
   if (topRow.length > 0) rows.push(topRow);
   rows.push(['📝 دورات', '✨ اكسترا']);
-  if (sub.correctionsLink) rows.push(['🔍 تصويبات المادة']);
+
+  if (sub.correctionsLink) {
+    rows.push(['🔍 تصويبات المادة']);
+  }
+
   rows.push([backText, '🏠 القائمة الرئيسية']);
+
   return Markup.keyboard(rows).resize();
 }
 
 function generateInlineTypeButtons(prefix, idStr, sub) {
   const rows = [];
   const topRow = [];
+
   if (sub.hasTheory) topRow.push(Markup.button.callback('📖 نظري', `${prefix}:${idStr}:نظري`));
   if (sub.hasPractical) topRow.push(Markup.button.callback('🔬 عملي', `${prefix}:${idStr}:عملي`));
   else if (sub.hasStage) topRow.push(Markup.button.callback('🏥 ستاج', `${prefix}:${idStr}:ستاج`));
@@ -974,10 +1029,14 @@ function generateInlineTypeButtons(prefix, idStr, sub) {
     Markup.button.callback('📝 دورات', `${prefix}:${idStr}:دورات`),
     Markup.button.callback('✨ اكسترا', `${prefix}:${idStr}:اكسترا`)
   ]);
+
   return rows;
 }
 
-const MAIN_MENU_KEYBOARD = Markup.keyboard([['📚 تصفح المحاضرات والملفات']]).resize();
+const MAIN_MENU_KEYBOARD = Markup.keyboard([
+  ['📚 تصفح المحاضرات والملفات']
+]).resize();
+
 const YEARS_KEYBOARD = Markup.keyboard([
   ['السنة الثانية', 'السنة الثالثة'],
   ['السنة الرابعة', 'السنة الخامسة'],
@@ -987,7 +1046,8 @@ const YEARS_KEYBOARD = Markup.keyboard([
 bot.start(async (ctx) => {
   browseState.delete(String(ctx.from.id));
   await ctx.reply(
-    `أهلاً بكم في الأرشيف الرسمي لفريق RBCs 🩺\nتفضلوا باختيار المحاضرات والملفات عبر القائمة أدناه.`,
+    `أهلاً بكم في الأرشيف الرسمي لفريق RBCs 🩺\n` +
+    `تفضلوا باختيار المحاضرات والملفات عبر القائمة أدناه.`,
     MAIN_MENU_KEYBOARD
   );
 });
@@ -998,14 +1058,19 @@ bot.start(async (ctx) => {
 bot.command(['files', 'edit', 'edit_files'], async (ctx) => {
   const userId = String(ctx.from.id);
   const user = await isUserAllowed(userId);
-  if (!user) return ctx.reply('عذراً، هذا الأمر مخصص لأعضاء الفريق المسجلين فقط.');
+
+  if (!user) {
+    return ctx.reply('عذراً، هذا الأمر مخصص لأعضاء الفريق المسجلين فقط.');
+  }
 
   const subjects = await getSubjectsData();
   const mySubs = user.isAdmin
     ? subjects
     : subjects.filter((s) => s.normYear === user.userYear || s.batch === user.userBatch);
 
-  if (mySubs.length === 0) return ctx.reply('لا توجد مواد متاحة لحسابك حالياً.');
+  if (mySubs.length === 0) {
+    return ctx.reply('لا توجد مواد متاحة لحسابك حالياً.');
+  }
 
   const subButtons = [];
   for (let i = 0; i < mySubs.length; i += 2) {
@@ -1034,6 +1099,7 @@ bot.action(/^ed_sub:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const subIdx = Number(ctx.match[1]);
   const sub = (await getSubjectsData())[subIdx];
+
   const rows = generateInlineTypeButtons('ed_type', String(subIdx), sub);
   rows.push([Markup.button.callback('❌ إغلاق', 'ed_close')]);
 
@@ -1834,7 +1900,7 @@ bot.action(/^itbatch:(.+):(\d+)$/, async (ctx) => {
   req.batch = chosenBatch;
   await ctx.editMessageText('✅ تم تسجيل بياناتك بنجاح، سيصلك إشعار فور تفعيل الحساب.');
 
-  const adminMsg =
+  const adminMsg = 
     `🔔 <b>تسجيل عضو في فريق IT:</b>\n\n` +
     `👤 <b>الاسم:</b> ${escapeHtml(req.fullName)}\n` +
     `🆔 <b>المعرّف:</b> <code>${req.telegramId}</code>\n` +
